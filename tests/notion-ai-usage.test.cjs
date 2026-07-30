@@ -12,6 +12,9 @@ const {
   BILLING_ENDPOINT,
   CURRENT_ENDPOINT,
   LEGACY_ENDPOINT,
+  LEGACY_POSITION_KEY,
+  LEGACY_POSITION_KEY_PREFIX,
+  POSITION_KEY,
   activeFailureCanCommit,
   activeBillingStatus,
   activeBusinessTrial,
@@ -21,6 +24,10 @@ const {
   businessTrialDaysRemaining,
   businessTrialEndsToday,
   clampOverlayPosition,
+  compactUsagePercent,
+  compactUsagePresentation,
+  composerCandidateEligible,
+  composerSemanticText,
   cssColorTheme,
   contextTokenMatches,
   currentUiLanguage,
@@ -37,15 +44,26 @@ const {
   normalizeBillingStatus,
   normalizeBusinessTrial,
   normalizeVerdict,
+  normalizeOverlayAnchor,
+  overlayAnchorFromRect,
+  overlayPositionRecord,
+  overlayPositionFromAnchor,
+  orderedLegacyPositionEntries,
   percentage,
+  parseLegacyOverlayPosition,
+  parseLegacyV2OverlayPosition,
   parseOverlayPosition,
   planDisplayName,
   pollingInterval,
   preferredVerticalSide,
   mergeRecipeHeaders,
+  minimizedDockPosition,
   requestBodyText,
+  responsiveOverlayVerticalSide,
   responseSequenceIsFresh,
   safeHeaders,
+  serializeOverlayPosition,
+  selectStoredOverlayPosition,
   shouldBootstrapInFrame,
   subscriptionStatusText,
   summaryClickTransition,
@@ -58,11 +76,192 @@ const SPACE_ID = '12345678-1234-4abc-8def-1234567890ab';
 const SCRIPT_PATH = path.resolve(__dirname, '../notion-ai-usage.user.js');
 const PACKAGE_PATH = path.resolve(__dirname, '../package.json');
 
+function makeFakeStorage(initial = {}) {
+  const values = new Map(Object.entries(initial));
+  const writes = [];
+  return {
+    writes,
+    get length() {
+      return values.size;
+    },
+    key(index) {
+      return Array.from(values.keys())[index] || null;
+    },
+    getItem(key) {
+      return values.has(key) ? values.get(key) : null;
+    },
+    setItem(key, value) {
+      const serialized = String(value);
+      writes.push({ key, value: serialized });
+      values.set(key, serialized);
+    },
+    removeItem(key) {
+      values.delete(key);
+    },
+  };
+}
+
+function makeEventTarget(rectangle) {
+  const listeners = new Map();
+  const capturedPointers = new Set();
+  return {
+    hidden: false,
+    listeners,
+    addEventListener(type, listener) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(listener);
+    },
+    dispatch(type, event) {
+      for (const listener of Array.from(listeners.get(type) || [])) listener(event);
+    },
+    getBoundingClientRect() {
+      return rectangle();
+    },
+    setPointerCapture(pointerId) {
+      capturedPointers.add(pointerId);
+    },
+    hasPointerCapture(pointerId) {
+      return capturedPointers.has(pointerId);
+    },
+    releasePointerCapture(pointerId) {
+      capturedPointers.delete(pointerId);
+    },
+  };
+}
+
+function loadPositionBrowserHarness(storage, viewport = { width: 1440, height: 900 }) {
+  const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
+  const marker = '  function mountUi() {';
+  assert.equal(source.includes(marker), true);
+  const instrumented = source.replace(
+    marker,
+    `  root.__notionAiUsagePositionTestHooks = {
+    runtime,
+    installOverlayDragging,
+    handleOverlayPositionStorage,
+    restoreOverlayPosition,
+    setMinimized,
+  };
+  return;
+
+${marker}`,
+  );
+  const rootListeners = new Map();
+  const sandbox = {
+    URL,
+    console: { warn() {} },
+    document: {
+      referrer: '',
+      documentElement: {
+        clientWidth: viewport.width,
+        clientHeight: viewport.height,
+      },
+    },
+    innerWidth: viewport.width,
+    innerHeight: viewport.height,
+    location: { href: 'https://app.notion.com/ai', ancestorOrigins: [] },
+    localStorage: storage,
+    addEventListener(type, listener) {
+      if (!rootListeners.has(type)) rootListeners.set(type, new Set());
+      rootListeners.get(type).add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (rootListeners.has(type)) rootListeners.get(type).delete(listener);
+    },
+    setTimeout() {
+      return 1;
+    },
+    clearTimeout() {},
+  };
+  const context = vm.createContext(sandbox);
+  vm.runInContext(instrumented, context, { filename: SCRIPT_PATH });
+  return {
+    hooks: context.__notionAiUsagePositionTestHooks,
+    dispatchRoot(type, event) {
+      for (const listener of Array.from(rootListeners.get(type) || [])) listener(event);
+    },
+  };
+}
+
+function installFakePositionUi(harness, initial = { left: 1100, top: 16 }) {
+  let ui;
+  const host = {
+    dataset: { side: 'right' },
+    style: {},
+    getBoundingClientRect() {
+      const width = ui && ui.minimized ? 57 : 300;
+      const height = ui && ui.minimized ? 28 : 38;
+      const styledLeft = Number.parseFloat(host.style.left);
+      const styledTop = Number.parseFloat(host.style.top);
+      const left = Number.isFinite(styledLeft) ? styledLeft : initial.left;
+      const top = Number.isFinite(styledTop) ? styledTop : initial.top;
+      return { left, right: left + width, top, bottom: top + height, width, height };
+    },
+  };
+  const handleRect = (width, height = width) => () => {
+    const rect = host.getBoundingClientRect();
+    return {
+      left: rect.left,
+      right: rect.left + width,
+      top: rect.top,
+      bottom: rect.top + height,
+      width,
+      height,
+    };
+  };
+  const summary = makeEventTarget(() => {
+    const rect = host.getBoundingClientRect();
+    return { ...rect, width: 300, height: 38, right: rect.left + 300, bottom: rect.top + 38 };
+  });
+  const orb = makeEventTarget(handleRect(57, 28));
+  const header = makeEventTarget(() => host.getBoundingClientRect());
+  ui = {
+    host,
+    shell: {
+      dataset: {},
+      removeAttribute(name) {
+        delete this.dataset[name.replace(/^data-/, '')];
+      },
+    },
+    orb,
+    summary,
+    header,
+    card: {
+      hidden: true,
+      getBoundingClientRect() {
+        return { width: 300, height: 300 };
+      },
+    },
+    expanded: false,
+    minimized: false,
+    position: null,
+    positionAnchor: null,
+    dragActive: false,
+    suppressSummaryClick: false,
+  };
+  harness.hooks.runtime.ui = ui;
+  return ui;
+}
+
+function pointerEvent(overrides = {}) {
+  return {
+    pointerId: 1,
+    clientX: 100,
+    clientY: 100,
+    button: 0,
+    isPrimary: true,
+    cancelable: true,
+    target: null,
+    preventDefault() {},
+    ...overrides,
+  };
+}
+
 test('uses AdGuard-compatible metadata and unsafeWindow realm constructors', () => {
   const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
-  assert.match(source, /^\/\/ @name\s+\[Notion AI\] Usage \[20260730\] v1\.1\.0$/m);
+  assert.match(source, /^\/\/ @name\s+\[Notion AI\] Usage \[20260731\] v1\.1\.2$/m);
   assert.match(source, /^\/\/ @namespace\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage$/m);
-  assert.match(source, /^\/\/ @version\s+20260730\.1\.1\.0$/m);
+  assert.match(source, /^\/\/ @version\s+20260731\.1\.1\.2$/m);
   assert.match(source, /^\/\/ @homepageURL\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage$/m);
   assert.match(source, /^\/\/ @supportURL\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage\/issues$/m);
   assert.match(source, /^\/\/ @downloadURL\s+https:\/\/raw\.githubusercontent\.com\/0-V-linuxdo\/notion-ai-usage\/main\/notion-ai-usage\.user\.js$/m);
@@ -110,8 +309,8 @@ test('uses AdGuard-compatible metadata and unsafeWindow realm constructors', () 
 test('keeps package and display release metadata aligned', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'));
   assert.equal(packageJson.name, 'notion-ai-usage');
-  assert.equal(packageJson.version, '1.1.0');
-  assert.equal(packageJson.releaseLabel, '[20260730] v1.1.0');
+  assert.equal(packageJson.version, '1.1.2');
+  assert.equal(packageJson.releaseLabel, '[20260731] v1.1.2');
   assert.equal(
     packageJson.repository.url,
     'git+https://github.com/0-V-linuxdo/notion-ai-usage.git',
@@ -149,6 +348,217 @@ test('runs in a top-level Notion page and a Tabbit-hosted Notion iframe', () => 
   tabbitFrame.parent = crossOriginParent;
 
   assert.equal(shouldBootstrapInFrame(tabbitFrame), true);
+});
+
+test('uses one stable page-local position key across top pages and rebuilt iframes', () => {
+  assert.equal(POSITION_KEY, 'notion-ai-usage:position:v2');
+  assert.equal(LEGACY_POSITION_KEY, 'notion-ai-usage:position:v1');
+  assert.equal(LEGACY_POSITION_KEY_PREFIX, 'notion-ai-usage:position:v2:');
+
+  const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
+  assert.doesNotMatch(source, /chatclub_frame_binding/);
+  assert.doesNotMatch(source, /positionScope|positionStorageScope|overlayPositionScope/);
+  assert.match(source, /root\.localStorage\.setItem\(POSITION_KEY, serialized\)/);
+});
+
+test('writes the canonical position exactly once only after a completed real drag', () => {
+  const storage = makeFakeStorage();
+  const harness = loadPositionBrowserHarness(storage);
+  const ui = installFakePositionUi(harness);
+  harness.hooks.installOverlayDragging(ui);
+  const positionWrites = () => storage.writes.filter((write) => write.key === POSITION_KEY);
+
+  ui.summary.dispatch('pointerdown', pointerEvent({ target: ui.summary }));
+  harness.dispatchRoot('pointermove', pointerEvent({ clientX: 102, clientY: 103 }));
+  harness.dispatchRoot('pointerup', pointerEvent());
+  assert.equal(positionWrites().length, 0);
+
+  ui.summary.dispatch(
+    'pointerdown',
+    pointerEvent({ pointerId: 2, target: ui.summary }),
+  );
+  harness.dispatchRoot(
+    'pointermove',
+    pointerEvent({ pointerId: 2, clientX: 104, clientY: 100 }),
+  );
+  harness.dispatchRoot('pointerup', pointerEvent({ pointerId: 2 }));
+  harness.dispatchRoot('pointerup', pointerEvent({ pointerId: 2 }));
+  assert.equal(positionWrites().length, 1);
+  assert.ok(parseOverlayPosition(storage.getItem(POSITION_KEY)));
+
+  ui.summary.dispatch(
+    'pointerdown',
+    pointerEvent({ pointerId: 3, target: ui.summary }),
+  );
+  harness.dispatchRoot(
+    'pointermove',
+    pointerEvent({ pointerId: 3, clientX: 120, clientY: 120 }),
+  );
+  harness.dispatchRoot('pointercancel', pointerEvent({ pointerId: 3 }));
+  assert.equal(positionWrites().length, 1);
+});
+
+test('a stale drag session cannot move or persist a remounted UI', () => {
+  const storage = makeFakeStorage();
+  const harness = loadPositionBrowserHarness(storage);
+  const staleUi = installFakePositionUi(harness);
+  harness.hooks.installOverlayDragging(staleUi);
+  staleUi.summary.dispatch('pointerdown', pointerEvent({ target: staleUi.summary }));
+
+  const currentUi = installFakePositionUi(harness, { left: 600, top: 40 });
+  harness.hooks.installOverlayDragging(currentUi);
+  harness.dispatchRoot('pointermove', pointerEvent({ clientX: 180, clientY: 180 }));
+  harness.dispatchRoot('pointerup', pointerEvent());
+
+  assert.equal(currentUi.host.style.left, undefined);
+  assert.equal(currentUi.host.style.top, undefined);
+  assert.equal(currentUi.dragActive, false);
+  assert.equal(storage.writes.length, 0);
+});
+
+test('applies only the newest canonical storage event and queues it during a drag', () => {
+  const first = {
+    xEdge: 'right',
+    xOffset: 16,
+    yEdge: 'top',
+    yOffset: 16,
+    side: 'right',
+    verticalSide: 'down',
+  };
+  const second = { ...first, xOffset: 80 };
+  const third = { ...first, xOffset: 120 };
+  const storage = makeFakeStorage({ [POSITION_KEY]: serializeOverlayPosition(first) });
+  const harness = loadPositionBrowserHarness(storage, { width: 720, height: 500 });
+  const ui = installFakePositionUi(harness, { left: 404, top: 16 });
+  harness.hooks.restoreOverlayPosition();
+  harness.hooks.installOverlayDragging(ui);
+
+  ui.summary.dispatch('pointerdown', pointerEvent({ target: ui.summary }));
+  storage.setItem(POSITION_KEY, serializeOverlayPosition(second));
+  harness.hooks.handleOverlayPositionStorage({
+    key: POSITION_KEY,
+    newValue: serializeOverlayPosition(second),
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(harness.hooks.runtime.pendingExternalAnchor.anchor)),
+    second,
+  );
+
+  storage.setItem(POSITION_KEY, serializeOverlayPosition(third));
+  harness.dispatchRoot('pointercancel', pointerEvent());
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.hooks.runtime.positionAnchor)), first);
+
+  harness.hooks.handleOverlayPositionStorage({
+    key: POSITION_KEY,
+    newValue: serializeOverlayPosition(second),
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.hooks.runtime.positionAnchor)), first);
+  harness.hooks.handleOverlayPositionStorage({
+    key: POSITION_KEY,
+    newValue: serializeOverlayPosition(third),
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.hooks.runtime.positionAnchor)), third);
+});
+
+test('restores canonical and legacy positions without migration writes', () => {
+  const anchor = {
+    xEdge: 'right',
+    xOffset: 16,
+    yEdge: 'top',
+    yOffset: 16,
+    side: 'right',
+    verticalSide: 'down',
+  };
+  const binding = `embedded-${'c'.repeat(64)}`;
+  const cases = [
+    {
+      initial: { [POSITION_KEY]: serializeOverlayPosition(anchor) },
+      expectedSource: anchor,
+    },
+    {
+      initial: {
+        [`${LEGACY_POSITION_KEY_PREFIX}${binding}`]: JSON.stringify({
+          v: 2,
+          scope: binding,
+          ...anchor,
+        }),
+      },
+      expectedSource: anchor,
+    },
+    {
+      initial: {
+        [LEGACY_POSITION_KEY]: JSON.stringify({
+          v: 1,
+          left: 100,
+          top: 80,
+          side: 'left',
+          verticalSide: 'up',
+        }),
+      },
+      expectedSource: {
+        xEdge: 'left',
+        xOffset: 100,
+        yEdge: 'bottom',
+        yOffset: 382,
+        side: 'left',
+        verticalSide: 'up',
+      },
+    },
+  ];
+
+  for (const { initial, expectedSource } of cases) {
+    const storage = makeFakeStorage(initial);
+    const harness = loadPositionBrowserHarness(storage, { width: 720, height: 500 });
+    installFakePositionUi(harness, { left: 404, top: 16 });
+    harness.hooks.restoreOverlayPosition();
+
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(harness.hooks.runtime.positionAnchor)),
+      expectedSource,
+    );
+    assert.equal(storage.writes.length, 0);
+  }
+});
+
+test('remounts a minimized orb without rewriting its position or preference', () => {
+  const anchor = {
+    xEdge: 'right',
+    xOffset: 16,
+    yEdge: 'top',
+    yOffset: 16,
+    side: 'right',
+    verticalSide: 'down',
+  };
+  const minimizedKey = 'notion-ai-usage:minimized:v1';
+  const storage = makeFakeStorage({
+    [POSITION_KEY]: serializeOverlayPosition(anchor),
+    [minimizedKey]: '1',
+  });
+
+  const first = loadPositionBrowserHarness(storage, { width: 720, height: 500 });
+  const firstUi = installFakePositionUi(first, { left: 404, top: 16 });
+  first.hooks.setMinimized(storage.getItem(minimizedKey) === '1', false);
+  first.hooks.restoreOverlayPosition();
+  assert.equal(firstUi.minimized, true);
+  assert.equal(firstUi.host.style.left, '647px');
+  assert.equal(storage.writes.length, 0);
+
+  first.hooks.setMinimized(false);
+  first.hooks.setMinimized(true);
+  assert.deepEqual(
+    storage.writes.map((write) => write.key),
+    [minimizedKey, minimizedKey],
+  );
+  assert.equal(storage.getItem(POSITION_KEY), serializeOverlayPosition(anchor));
+
+  storage.writes.length = 0;
+  const remount = loadPositionBrowserHarness(storage, { width: 1000, height: 600 });
+  const remountedUi = installFakePositionUi(remount, { left: 940, top: 16 });
+  remount.hooks.setMinimized(storage.getItem(minimizedKey) === '1', false);
+  remount.hooks.restoreOverlayPosition();
+  assert.equal(remountedUi.minimized, true);
+  assert.equal(remountedUi.host.style.left, '927px');
+  assert.equal(storage.writes.length, 0);
 });
 
 test('skips nested Notion frames but not similarly named hostile hosts', () => {
@@ -231,6 +641,78 @@ test('clamps dragged overlay coordinates to the visible viewport', () => {
   );
 });
 
+test('centers the minimized circles inside the composer bottom without changing an anchor', () => {
+  const composer = {
+    left: 260,
+    top: 580,
+    right: 980,
+    bottom: 720,
+    width: 720,
+    height: 140,
+  };
+  assert.deepEqual(
+    minimizedDockPosition(
+      composer,
+      { width: 57, height: 28 },
+      { width: 1200, height: 800 },
+    ),
+    { left: 591.5, top: 685 },
+  );
+  assert.deepEqual(
+    minimizedDockPosition(
+      { left: -30, top: 750, right: 270, bottom: 830, width: 300, height: 80 },
+      { width: 57, height: 28 },
+      { width: 320, height: 800 },
+    ),
+    { left: 91.5, top: 764 },
+  );
+  assert.equal(
+    minimizedDockPosition(null, { width: 57, height: 28 }, { width: 1200, height: 800 }),
+    null,
+  );
+});
+
+test('rejects ordinary Notion editors unless they have an AI composer signal', () => {
+  for (const ordinary of [
+    'comment-composer',
+    'prompt-editor',
+    '发送消息',
+    '输入消息',
+    '提问',
+  ]) {
+    assert.equal(composerSemanticText(ordinary), false, ordinary);
+  }
+  for (const aiComposer of [
+    'notion-ai-prompt',
+    'Do anything with AI',
+    'Ask AI',
+    '向 AI 提问',
+  ]) {
+    assert.equal(composerSemanticText(aiComposer), true, aiComposer);
+  }
+  assert.equal(
+    composerCandidateEligible(
+      { semantic: false, textarea: true, textbox: true, lexical: true },
+      { aiQualified: false },
+    ),
+    false,
+  );
+  assert.equal(
+    composerCandidateEligible(
+      { semantic: true, textarea: false, textbox: true, lexical: false },
+      { aiQualified: false },
+    ),
+    true,
+  );
+  assert.equal(
+    composerCandidateEligible(
+      { semantic: false, textarea: false, textbox: true, lexical: true },
+      { aiQualified: true },
+    ),
+    true,
+  );
+});
+
 test('calculates drag movement and latches only after the movement threshold', () => {
   assert.deepEqual(
     dragPosition(
@@ -247,25 +729,206 @@ test('calculates drag movement and latches only after the movement threshold', (
   assert.equal(dragThresholdReached(true, null, null), true);
 });
 
-test('accepts only finite versioned overlay positions and consumes one drag click', () => {
-  assert.deepEqual(
-    parseOverlayPosition('{"v":1,"left":100.5,"top":80}'),
-    { left: 100.5, top: 80 },
-  );
-  assert.deepEqual(
-    parseOverlayPosition(
-      '{"v":1,"left":100,"top":80,"side":"left","verticalSide":"up"}',
-    ),
-    { left: 100, top: 80, side: 'left', verticalSide: 'up' },
-  );
-  assert.equal(parseOverlayPosition('{"v":2,"left":100,"top":80}'), null);
-  assert.equal(parseOverlayPosition('{"v":1,"left":"100","top":80}'), null);
-  assert.equal(parseOverlayPosition('{"v":1,"left":null,"top":80}'), null);
+test('round-trips one canonical anchor and reads scoped v2 or v1 only as fallbacks', () => {
+  const stored = {
+    v: 2,
+    xEdge: 'right',
+    xOffset: 0,
+    yEdge: 'bottom',
+    yOffset: 16,
+    side: 'right',
+    verticalSide: 'up',
+  };
+  const anchor = {
+    xEdge: 'right',
+    xOffset: 0,
+    yEdge: 'bottom',
+    yOffset: 16,
+    side: 'right',
+    verticalSide: 'up',
+  };
+  assert.deepEqual(overlayPositionRecord(anchor), stored);
+  assert.equal(serializeOverlayPosition(anchor), JSON.stringify(stored));
+  assert.deepEqual(parseOverlayPosition(serializeOverlayPosition(anchor)), anchor);
+  assert.deepEqual(normalizeOverlayAnchor(anchor, true), anchor);
+
+  const invalid = [
+    { ...stored, v: 1 },
+    { ...stored, scope: 'top' },
+    { ...stored, xEdge: 'center' },
+    { ...stored, yEdge: 'middle' },
+    { ...stored, side: 'center' },
+    { ...stored, verticalSide: 'left' },
+    { ...stored, xOffset: -1 },
+    { ...stored, yOffset: '16' },
+    { ...stored, xOffset: null },
+  ];
+  for (const value of invalid) {
+    assert.equal(parseOverlayPosition(JSON.stringify(value)), null);
+  }
+  assert.equal(parseOverlayPosition('{"v":2,"xOffset":1e999}'), null);
   assert.equal(parseOverlayPosition('[1,2]'), null);
   assert.equal(parseOverlayPosition('not json'), null);
 
+  const bindingA = `embedded-${'a'.repeat(64)}`;
+  const bindingB = `embedded-${'b'.repeat(64)}`;
+  const scopedA = {
+    key: `${LEGACY_POSITION_KEY_PREFIX}${bindingA}`,
+    raw: JSON.stringify({ ...stored, scope: bindingA, xOffset: 31 }),
+  };
+  const scopedB = {
+    key: `${LEGACY_POSITION_KEY_PREFIX}${bindingB}`,
+    raw: JSON.stringify({ ...stored, scope: bindingB, xOffset: 47 }),
+  };
+  const generic = {
+    key: `${LEGACY_POSITION_KEY_PREFIX}embedded`,
+    raw: JSON.stringify({ ...stored, scope: 'embedded', xOffset: 13 }),
+  };
+  assert.equal(parseOverlayPosition(scopedA.raw), null);
+  assert.deepEqual(parseLegacyV2OverlayPosition(scopedA.key, scopedA.raw), {
+    ...anchor,
+    xOffset: 31,
+  });
+  assert.equal(
+    parseLegacyV2OverlayPosition(scopedA.key, JSON.stringify({ ...stored, scope: bindingB })),
+    null,
+  );
+  assert.deepEqual(
+    orderedLegacyPositionEntries([generic, scopedA, scopedB]).map((entry) => entry.key),
+    [scopedB.key, scopedA.key, generic.key],
+  );
+
+  const legacyRaw =
+    '{"v":1,"left":100,"top":80,"side":"left","verticalSide":"up"}';
+  const legacy = { left: 100, top: 80, side: 'left', verticalSide: 'up' };
+  assert.deepEqual(parseLegacyOverlayPosition(legacyRaw), legacy);
+  assert.equal(parseLegacyOverlayPosition('{"v":1,"left":"100","top":80}'), null);
+  assert.deepEqual(
+    selectStoredOverlayPosition(JSON.stringify(stored), [scopedA], legacyRaw),
+    { kind: 'anchor', source: 'canonical', anchor },
+  );
+  assert.deepEqual(
+    selectStoredOverlayPosition('broken', [generic, scopedA, scopedB], legacyRaw),
+    { kind: 'anchor', source: 'legacy-v2', anchor: { ...anchor, xOffset: 47 } },
+  );
+  assert.deepEqual(selectStoredOverlayPosition('broken', [], legacyRaw), {
+    kind: 'legacy',
+    source: 'legacy-v1',
+    position: legacy,
+  });
+  assert.equal(selectStoredOverlayPosition('broken', [], 'broken'), null);
+});
+
+test('keeps summary edge offsets stable across Arc, Tabbit, expansion, and resize clamps', () => {
+  const anchor = {
+    xEdge: 'right',
+    xOffset: 16,
+    yEdge: 'top',
+    yOffset: 16,
+    side: 'right',
+    verticalSide: 'down',
+  };
+  const collapsed = { width: 300, height: 38, offsetLeft: 0, offsetTop: 0 };
+  assert.deepEqual(
+    overlayPositionFromAnchor(
+      anchor,
+      { width: 1440, height: 900 },
+      { width: 300, height: 38 },
+      collapsed,
+    ),
+    { left: 1124, top: 16 },
+  );
+  assert.deepEqual(
+    overlayPositionFromAnchor(
+      anchor,
+      { width: 720, height: 500 },
+      { width: 300, height: 38 },
+      collapsed,
+    ),
+    { left: 404, top: 16 },
+  );
+
+  assert.deepEqual(
+    overlayPositionFromAnchor(
+      anchor,
+      { width: 720, height: 500 },
+      { width: 336, height: 345 },
+      { width: 300, height: 38, offsetLeft: 36, offsetTop: 0 },
+    ),
+    { left: 368, top: 16 },
+  );
+  assert.deepEqual(
+    overlayPositionFromAnchor(
+      { ...anchor, yEdge: 'bottom', yOffset: 16, verticalSide: 'up' },
+      { width: 720, height: 500 },
+      { width: 336, height: 345 },
+      { width: 300, height: 38, offsetLeft: 36, offsetTop: 307 },
+    ),
+    { left: 368, top: 139 },
+  );
+
+  const preserved = { ...anchor };
+  assert.deepEqual(
+    overlayPositionFromAnchor(
+      preserved,
+      { width: 280, height: 180 },
+      { width: 336, height: 100 },
+      collapsed,
+    ),
+    { left: 8, top: 16 },
+  );
+  assert.deepEqual(preserved, anchor);
+  assert.deepEqual(
+    overlayPositionFromAnchor(
+      preserved,
+      { width: 1440, height: 900 },
+      { width: 200, height: 38 },
+      { ...collapsed, width: 200 },
+    ),
+    { left: 1224, top: 16 },
+  );
+
+  for (const width of [720, 1440, 720, 1440, 720]) {
+    const position = overlayPositionFromAnchor(
+      anchor,
+      { width, height: 900 },
+      { width: 300, height: 38 },
+      collapsed,
+    );
+    assert.deepEqual(
+      overlayAnchorFromRect(
+        {
+          left: position.left,
+          right: position.left + 300,
+          top: position.top,
+          bottom: position.top + 38,
+          width: 300,
+          height: 38,
+        },
+        { width, height: 900 },
+        'right',
+        'top',
+      ),
+      { xEdge: 'right', xOffset: 16, yEdge: 'top', yOffset: 16 },
+    );
+  }
+});
+
+test('chooses deterministic nearest edges and consumes one drag click', () => {
+  assert.deepEqual(
+    overlayAnchorFromRect(
+      { left: 350, right: 650, top: 431, bottom: 469, width: 300, height: 38 },
+      { width: 1000, height: 900 },
+    ),
+    { xEdge: 'left', xOffset: 350, yEdge: 'top', yOffset: 431 },
+  );
+
   assert.deepEqual(summaryClickTransition(false, false), {
     expanded: true,
+    suppressNextClick: false,
+  });
+  assert.deepEqual(summaryClickTransition(true, false), {
+    expanded: false,
     suppressNextClick: false,
   });
   assert.deepEqual(summaryClickTransition(true, true), {
@@ -274,33 +937,231 @@ test('accepts only finite versioned overlay positions and consumes one drag clic
   });
 });
 
-test('wires pointer dragging, persistence, and roomier capsule spacing', () => {
+test('switches expanded direction responsively without changing the stored anchor', () => {
+  const anchor = {
+    xEdge: 'left',
+    xOffset: 20,
+    yEdge: 'top',
+    yOffset: 350,
+    side: 'left',
+    verticalSide: 'down',
+  };
+  const summary = { width: 300, height: 38 };
+  assert.equal(
+    responsiveOverlayVerticalSide(anchor, summary, 307, { width: 1000, height: 900 }, true),
+    'down',
+  );
+  assert.equal(
+    responsiveOverlayVerticalSide(anchor, summary, 307, { width: 1000, height: 500 }, true),
+    'up',
+  );
+  assert.equal(
+    responsiveOverlayVerticalSide(
+      { ...anchor, verticalSide: 'up' },
+      summary,
+      307,
+      { width: 1000, height: 900 },
+      true,
+    ),
+    'up',
+  );
+  assert.equal(
+    responsiveOverlayVerticalSide(
+      { ...anchor, yOffset: 100, verticalSide: 'up' },
+      summary,
+      307,
+      { width: 1000, height: 900 },
+      true,
+    ),
+    'down',
+  );
+  assert.equal(
+    responsiveOverlayVerticalSide(anchor, summary, 307, { width: 1000, height: 500 }, false),
+    'down',
+  );
+  assert.deepEqual(anchor, {
+    xEdge: 'left',
+    xOffset: 20,
+    yEdge: 'top',
+    yOffset: 350,
+    side: 'left',
+    verticalSide: 'down',
+  });
+});
+
+test('shows 6h and active monthly allowances separately in the minimized orb', () => {
+  const snapshot = {
+    status: 'within_limit',
+    rolling: { percent: 79 },
+    monthly: { percent: 64, resetAt: NOW + 1000 },
+  };
+  assert.equal(compactUsagePercent(snapshot, NOW), 79);
+  assert.equal(
+    compactUsagePercent(
+      { ...snapshot, rolling: { percent: 51 }, monthly: { percent: 84, resetAt: NOW + 1 } },
+      NOW,
+    ),
+    84,
+  );
+  assert.equal(
+    compactUsagePercent(
+      { ...snapshot, rolling: { percent: 51 }, monthly: { percent: 99, resetAt: NOW } },
+      NOW,
+    ),
+    51,
+  );
+  assert.equal(compactUsagePercent({ status: 'not_applicable' }, NOW), null);
+  assert.equal(compactUsagePercent(null, NOW), null);
+  assert.deepEqual(compactUsagePresentation(snapshot, NOW), {
+    status: 'available',
+    rolling: { percent: 79, text: '79%', tone: 'warning', status: 'available' },
+    monthly: { percent: 64, text: '64%', tone: 'normal', status: 'available' },
+  });
+  assert.deepEqual(compactUsagePresentation({ status: 'not_applicable' }, NOW), {
+    status: 'not_applicable',
+    rolling: {
+      percent: null,
+      text: '—',
+      tone: 'neutral',
+      status: 'not_applicable',
+    },
+    monthly: {
+      percent: null,
+      text: '—',
+      tone: 'neutral',
+      status: 'not_applicable',
+    },
+  });
+  assert.deepEqual(
+    compactUsagePresentation(
+      {
+        status: 'rate_limited',
+        limitedBy: 'rolling',
+        rolling: { percent: 42 },
+        monthly: { percent: 17, resetAt: NOW + 1 },
+      },
+      NOW,
+    ),
+    {
+      status: 'rate_limited',
+      rolling: { percent: 42, text: '42%', tone: 'danger', status: 'rate_limited' },
+      monthly: { percent: 17, text: '17%', tone: 'normal', status: 'available' },
+    },
+  );
+  assert.deepEqual(compactUsagePresentation(null, NOW), {
+    status: 'waiting',
+    rolling: { percent: null, text: '…', tone: 'waiting', status: 'waiting' },
+    monthly: { percent: null, text: '…', tone: 'waiting', status: 'waiting' },
+  });
+});
+
+test('wires canonical position persistence, composer docking, dual circles, and spacing', () => {
   const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
-  assert.match(source, /const POSITION_KEY = 'notion-ai-usage:position:v1';/);
+  assert.match(source, /const LEGACY_POSITION_KEY = 'notion-ai-usage:position:v1';/);
+  assert.match(source, /const POSITION_KEY = 'notion-ai-usage:position:v2';/);
+  assert.match(source, /const MINIMIZED_KEY = 'notion-ai-usage:minimized:v1';/);
+  assert.match(source, /root\.localStorage\.getItem\(LEGACY_POSITION_KEY\)/);
+  assert.match(source, /root\.localStorage\.getItem\(POSITION_KEY\)/);
+  assert.match(source, /root\.localStorage\.setItem\(POSITION_KEY, serialized\)/);
+  assert.match(source, /root\.localStorage\.getItem\(POSITION_KEY\) !== serialized/);
+  assert.doesNotMatch(source, /setItem\(\s*LEGACY_POSITION_KEY/);
+  assert.doesNotMatch(source, /removeItem\(\s*LEGACY_POSITION_KEY/);
+  assert.doesNotMatch(source, /chatclub_frame_binding|restoreLateBoundOverlayPosition/);
+  assert.match(source, /function installOverlayDragging\(ui\)/);
   assert.match(source, /handle\.addEventListener\('pointerdown'/);
-  assert.match(source, /handle\.addEventListener\('pointermove'/);
-  assert.match(source, /handle\.addEventListener\('pointerup'/);
-  assert.match(source, /handle\.addEventListener\('pointercancel'/);
+  assert.match(source, /root\.addEventListener\('pointermove'/);
+  assert.match(source, /root\.addEventListener\('pointerup'/);
+  assert.match(source, /root\.addEventListener\('pointercancel'/);
+  assert.match(source, /root\.removeEventListener\('pointermove'/);
+  assert.match(source, /root\.removeEventListener\('pointerup'/);
+  assert.match(source, /root\.removeEventListener\('pointercancel'/);
+  assert.doesNotMatch(source, /handle\.addEventListener\('pointerleave'/);
   assert.match(source, /handle\.setPointerCapture\(event\.pointerId\)/);
-  assert.match(source, /installDragHandle\(runtime\.ui\.summary, \{ suppressClick: true \}\)/);
-  assert.match(source, /installDragHandle\(runtime\.ui\.header, \{ ignoreInteractive: true \}\)/);
-  assert.match(source, /root\.addEventListener\('resize', \(\) => keepOverlayInViewport\(true\)/);
+  assert.match(source, /installOverlayDragging\(runtime\.ui\)/);
+  assert.match(source, /root\.addEventListener\('resize', keepOverlayInViewport/);
+  assert.match(source, /root\.addEventListener\('storage', handleOverlayPositionStorage\)/);
+  assert.doesNotMatch(source, /keepOverlayInViewport\(true\)/);
+  assert.match(source, /positionAnchor: null/);
+  assert.match(source, /positionLoadStatus: 'unloaded'/);
+  assert.match(source, /pendingExternalAnchor: null/);
+  assert.match(source, /dragActive: false/);
+  assert.match(source, /function setMinimized\(minimized, persist = true\)/);
+  assert.doesNotMatch(source, /handle: ui\.orb/);
+  assert.match(source, /ui\.minimized \|\|\n\s*runtime\.ui !== ui/);
+  assert.match(source, /function minimizedDockPosition\(/);
+  assert.match(source, /function findNotionAiComposer\(/);
+  assert.match(source, /if \(!composerCandidateEligible\(signals, container\)\)/);
+  assert.match(source, /let sawAiSemantic = composerSemanticText\(composerAttributeText\(editor\)\)/);
+  assert.match(source, /if \(semantic\) sawAiSemantic = true;/);
+  assert.match(source, /if \(sawAiSemantic\) best\.aiQualified = true;/);
+  assert.match(source, /activeElement !== ui\.host/);
+  assert.match(source, /function dockMinimizedOverlay\(/);
+  assert.match(source, /ui\.host\.dataset\.docked = 'composer'/);
+  assert.match(source, /new root\.MutationObserver\(\(\) =>/);
+  assert.match(source, /new root\.ResizeObserver\(\(\) =>/);
+  assert.match(source, /\{ childList: true, subtree: true \}/);
+  assert.match(source, /root\.addEventListener\('scroll', scheduleMinimizedDock/);
+  assert.match(source, /root\.addEventListener\('focusin', scheduleMinimizedDock/);
+  assert.match(source, /const COMPOSER_SCAN_COOLDOWN_MS = 600;/);
+  assert.match(source, /COMPOSER_SCAN_COOLDOWN_MS - elapsedSinceScan/);
+  assert.ok(source.indexOf('restoreOverlayPosition();') < source.indexOf('setMinimized(minimized, false);'));
 
   const summaryRule = source.match(/\.summary \{([\s\S]*?)\n        \}/)?.[1] || '';
+  const summaryToggleRule =
+    source.match(/\.summary-toggle \{([\s\S]*?)\n        \}/)?.[1] || '';
+  const orbRule = source.match(/\.orb \{([\s\S]*?)\n        \}/)?.[1] || '';
+  const orbMetricRule = source.match(/\.orb-metric \{([\s\S]*?)\n        \}/)?.[1] || '';
+  const orbRingRule = source.match(/\.orb-ring \{([\s\S]*?)\n        \}/)?.[1] || '';
   const headerRule = source.match(/\.header \{([\s\S]*?)\n        \}/)?.[1] || '';
-  assert.match(summaryRule, /gap:\s*var\(--usage-summary-item-gap\);/);
+  assert.match(orbRule, /touch-action:\s*manipulation;/);
+  assert.match(orbRule, /cursor:\s*pointer;/);
+  assert.match(source, /conic-gradient\(/);
+  assert.equal((source.match(/class="orb-metric"/g) || []).length, 2);
+  assert.match(source, /class="orb-ring orb-rolling-ring"/);
+  assert.match(source, /class="orb-ring orb-monthly-ring"/);
+  assert.doesNotMatch(source, /class="orb-label"|orbMonthlyLabel/);
+  assert.match(source, /class="summary-minimize"/);
+  assert.doesNotMatch(source, /class="action icon-action minimize"/);
+  assert.match(source, /ignoreSelector: '\.summary-minimize'/);
+  assert.match(source, /runtime\.ui\.summary\.addEventListener\('click'/);
+  assert.match(orbRule, /min-height:\s*28px;/);
+  assert.match(orbRule, /padding:\s*2px;/);
+  assert.match(orbMetricRule, /width:\s*24px;/);
+  assert.match(orbMetricRule, /height:\s*24px;/);
+  assert.match(orbMetricRule, /flex:\s*0 0 24px;/);
+  assert.match(orbRingRule, /display:\s*block;/);
+  assert.match(orbRingRule, /width:\s*24px;/);
+  assert.match(orbRingRule, /height:\s*24px;/);
+  assert.match(source, /font-size:\s*7px;/);
+  assert.match(source, /color:\s*var\(--usage-orb-value\);/);
+  assert.equal((source.match(/--usage-orb-value:\s*#f7f7f5;/g) || []).length, 2);
+  assert.match(source, /opacity:\s*0;/);
+  assert.match(source, /\.orb:hover \.orb-value,/);
+  assert.match(source, /\.orb:focus-visible \.orb-value \{ opacity: 1; \}/);
+  assert.doesNotMatch(source, /ui\.orb\.title\s*=/);
+  assert.match(summaryRule, /gap:\s*2px;/);
   assert.match(summaryRule, /min-height:\s*38px;/);
-  assert.match(summaryRule, /padding:\s*8px 13px;/);
+  assert.match(summaryRule, /padding:\s*0 6px 0 0;/);
   assert.match(summaryRule, /touch-action:\s*none;/);
   assert.match(summaryRule, /user-select:\s*none;/);
+  assert.match(summaryToggleRule, /gap:\s*var\(--usage-summary-item-gap\);/);
+  assert.match(summaryToggleRule, /padding:\s*8px 5px 8px 13px;/);
   assert.match(headerRule, /cursor:\s*grab;/);
   assert.match(headerRule, /touch-action:\s*none;/);
-  assert.match(source, /\.summary-part:first-child \{ word-spacing: 2px; \}/);
+  assert.doesNotMatch(source, />AI Usage<|`AI \$\{formatPercent/);
+  assert.match(source, /\{ text: formatPercent\(snapshot\.rolling\.percent\) \}/);
   assert.match(source, /\.summary-part\[data-separator="usage"\]::before/);
   assert.match(source, /\.summary-part\[data-separator="billing"\]::before/);
   assert.doesNotMatch(source, /\.summary-part:nth-child/);
   assert.match(source, /margin: 0 var\(--usage-summary-separator-space\);/);
   assert.match(source, /:host\(\[data-vertical-side="up"\]\) \.shell/);
+  assert.match(source, /class="action icon-action native-page"/);
+  assert.match(source, /ui\.nativePage\.setAttribute\('aria-label'/);
+  assert.match(source, /ui\.nativePage\.title = uiText/);
+  assert.match(source, /<path d="M14 4h6v6"><\/path>/);
+  assert.match(source, /<svg viewBox="0 0 24 24" aria-hidden="true">/);
+  assert.match(source, /\.footer-actions \{ display: flex; flex: 0 0 auto; gap: 5px; \}/);
+  assert.doesNotMatch(source, /ui\.nativePage\.textContent/);
 });
 
 test('calculates clamped usage percentages', () => {

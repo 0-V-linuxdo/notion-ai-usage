@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         [Notion AI] Usage [20260730] v1.1.0
+// @name         [Notion AI] Usage [20260731] v1.1.2
 // @namespace    https://github.com/0-V-linuxdo/notion-ai-usage
-// @version      20260730.1.1.0
+// @version      20260731.1.1.2
 // @description  Show Notion AI usage and workspace plan status without exposing cookies or tokens.
 // @homepageURL  https://github.com/0-V-linuxdo/notion-ai-usage
 // @supportURL   https://github.com/0-V-linuxdo/notion-ai-usage/issues
@@ -24,8 +24,14 @@
   const SCRIPT_PREFIX = '[Notion AI Usage]';
   const HOST_ID = 'notion-ai-usage-userscript-host';
   const EXPANDED_KEY = 'notion-ai-usage:expanded:v1';
-  const POSITION_KEY = 'notion-ai-usage:position:v1';
+  const MINIMIZED_KEY = 'notion-ai-usage:minimized:v1';
+  const LEGACY_POSITION_KEY = 'notion-ai-usage:position:v1';
+  const POSITION_KEY = 'notion-ai-usage:position:v2';
+  const LEGACY_POSITION_KEY_PREFIX = `${POSITION_KEY}:`;
+  const LEGACY_POSITION_SCOPE_PATTERN = /^(?:top|embedded(?:-[0-9a-f]{64})?)$/;
   const POSITION_INSET = 8;
+  const COMPOSER_DOCK_INSET = 7;
+  const COMPOSER_SCAN_COOLDOWN_MS = 600;
   const DRAG_THRESHOLD = 4;
   const MIN_REFRESH_INTERVAL = 15000;
   const BILLING_REFRESH_INTERVAL = 60 * 60 * 1000;
@@ -59,6 +65,17 @@
     ['enterprise', 5],
     ['enterprise_limited', 5],
   ]);
+  const COMPOSER_EDITOR_SELECTOR = [
+    'textarea',
+    '[role="textbox"][contenteditable="true"]',
+    '[role="textbox"][contenteditable="plaintext-only"]',
+    '[contenteditable="true"]',
+    '[contenteditable="plaintext-only"]',
+  ].join(',');
+  const COMPOSER_SEMANTIC_PATTERN =
+    /(?:notion[\s_-]*ai|do\s+anything\s+with\s+ai|ask[\s_-]*(?:notion[\s_-]*)?ai|ai[\s_-]*(?:chat|input|prompt|composer|assistant)|(?:chat|input|prompt|composer|message)[\s_-]*(?:for[\s_-]*|with[\s_-]*)?ai|(?:用|向|让|问)\s*(?:notion\s*)?ai|ai\s*(?:助手|输入|对话|提问))/i;
+  const COMPOSER_STRUCTURE_PATTERN = /(?:composer|prompt|comment|message|输入|发送|提问)/i;
+  const COMPOSER_SEND_PATTERN = /(?:send|submit|发送|提交)/i;
 
   function isRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -844,7 +861,7 @@
     return 60000;
   }
 
-  function parseOverlayPosition(raw) {
+  function parseLegacyOverlayPosition(raw) {
     if (typeof raw !== 'string' || raw.length === 0) return null;
     try {
       const parsed = JSON.parse(raw);
@@ -868,6 +885,220 @@
     }
   }
 
+  function normalizeOverlayAnchor(anchor, roundOffsets = false) {
+    if (
+      !isRecord(anchor) ||
+      (anchor.xEdge !== 'left' && anchor.xEdge !== 'right') ||
+      (anchor.yEdge !== 'top' && anchor.yEdge !== 'bottom') ||
+      (anchor.side !== 'left' && anchor.side !== 'right') ||
+      (anchor.verticalSide !== 'up' && anchor.verticalSide !== 'down')
+    ) {
+      return null;
+    }
+    if (
+      typeof anchor.xOffset !== 'number' ||
+      !Number.isFinite(anchor.xOffset) ||
+      anchor.xOffset < 0 ||
+      typeof anchor.yOffset !== 'number' ||
+      !Number.isFinite(anchor.yOffset) ||
+      anchor.yOffset < 0
+    ) {
+      return null;
+    }
+    return {
+      xEdge: anchor.xEdge,
+      xOffset: roundOffsets ? Math.round(anchor.xOffset) : anchor.xOffset,
+      yEdge: anchor.yEdge,
+      yOffset: roundOffsets ? Math.round(anchor.yOffset) : anchor.yOffset,
+      side: anchor.side,
+      verticalSide: anchor.verticalSide,
+    };
+  }
+
+  function overlayPositionRecord(anchor) {
+    const normalized = normalizeOverlayAnchor(anchor, true);
+    return normalized ? { v: 2, ...normalized } : null;
+  }
+
+  function serializeOverlayPosition(anchor) {
+    const record = overlayPositionRecord(anchor);
+    return record ? JSON.stringify(record) : null;
+  }
+
+  function parseOverlayPosition(raw) {
+    if (typeof raw !== 'string' || raw.length === 0) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!isRecord(parsed) || parsed.v !== 2 || parsed.scope !== undefined) return null;
+      return normalizeOverlayAnchor(parsed);
+    } catch {
+      return null;
+    }
+  }
+
+  function legacyOverlayPositionScope(key) {
+    if (typeof key !== 'string' || !key.startsWith(LEGACY_POSITION_KEY_PREFIX)) {
+      return null;
+    }
+    const scope = key.slice(LEGACY_POSITION_KEY_PREFIX.length);
+    return LEGACY_POSITION_SCOPE_PATTERN.test(scope) ? scope : null;
+  }
+
+  function parseLegacyV2OverlayPosition(key, raw) {
+    const scope = legacyOverlayPositionScope(key);
+    if (!scope || typeof raw !== 'string' || raw.length === 0) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!isRecord(parsed) || parsed.v !== 2 || parsed.scope !== scope) return null;
+      return normalizeOverlayAnchor(parsed);
+    } catch {
+      return null;
+    }
+  }
+
+  function orderedLegacyPositionEntries(entries) {
+    if (!Array.isArray(entries)) return [];
+    return entries
+      .filter((entry) => isRecord(entry) && legacyOverlayPositionScope(entry.key))
+      .slice()
+      .sort((left, right) => {
+        const leftScope = legacyOverlayPositionScope(left.key);
+        const rightScope = legacyOverlayPositionScope(right.key);
+        const leftRank = leftScope.startsWith('embedded-')
+          ? 0
+          : leftScope === 'embedded'
+            ? 1
+            : 2;
+        const rightRank = rightScope.startsWith('embedded-')
+          ? 0
+          : rightScope === 'embedded'
+            ? 1
+            : 2;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+        if (left.key === right.key) return 0;
+        return left.key > right.key ? -1 : 1;
+      });
+  }
+
+  function selectStoredOverlayPosition(canonicalRaw, legacyV2Entries, legacyRaw) {
+    const canonical = parseOverlayPosition(canonicalRaw);
+    if (canonical) return { kind: 'anchor', source: 'canonical', anchor: canonical };
+    for (const entry of orderedLegacyPositionEntries(legacyV2Entries)) {
+      const anchor = parseLegacyV2OverlayPosition(entry.key, entry.raw);
+      if (anchor) return { kind: 'anchor', source: 'legacy-v2', anchor };
+    }
+    const position = parseLegacyOverlayPosition(legacyRaw);
+    return position ? { kind: 'legacy', source: 'legacy-v1', position } : null;
+  }
+
+  function overlayAnchorFromRect(
+    rect,
+    viewport,
+    preferredXEdge = null,
+    preferredYEdge = null,
+  ) {
+    const viewportWidth = Math.max(0, finiteNumber(viewport && viewport.width) || 0);
+    const viewportHeight = Math.max(0, finiteNumber(viewport && viewport.height) || 0);
+    const left = finiteNumber(rect && rect.left) || 0;
+    const top = finiteNumber(rect && rect.top) || 0;
+    const width = Math.max(0, finiteNumber(rect && rect.width) || 0);
+    const height = Math.max(0, finiteNumber(rect && rect.height) || 0);
+    const right = finiteNumber(rect && rect.right);
+    const bottom = finiteNumber(rect && rect.bottom);
+    const safeRight = right === null ? left + width : right;
+    const safeBottom = bottom === null ? top + height : bottom;
+    const leftOffset = Math.max(0, left);
+    const rightOffset = Math.max(0, viewportWidth - safeRight);
+    const topOffset = Math.max(0, top);
+    const bottomOffset = Math.max(0, viewportHeight - safeBottom);
+    const xEdge =
+      preferredXEdge === 'left' || preferredXEdge === 'right'
+        ? preferredXEdge
+        : leftOffset <= rightOffset
+          ? 'left'
+          : 'right';
+    const yEdge =
+      preferredYEdge === 'top' || preferredYEdge === 'bottom'
+        ? preferredYEdge
+        : topOffset <= bottomOffset
+          ? 'top'
+          : 'bottom';
+    return {
+      xEdge,
+      xOffset: xEdge === 'left' ? leftOffset : rightOffset,
+      yEdge,
+      yOffset: yEdge === 'top' ? topOffset : bottomOffset,
+    };
+  }
+
+  function overlayPositionFromAnchor(
+    anchor,
+    viewport,
+    overlay,
+    summary,
+    inset = POSITION_INSET,
+  ) {
+    const viewportWidth = Math.max(0, finiteNumber(viewport && viewport.width) || 0);
+    const viewportHeight = Math.max(0, finiteNumber(viewport && viewport.height) || 0);
+    const summaryWidth = Math.max(0, finiteNumber(summary && summary.width) || 0);
+    const summaryHeight = Math.max(0, finiteNumber(summary && summary.height) || 0);
+    const summaryOffsetLeft = finiteNumber(summary && summary.offsetLeft) || 0;
+    const summaryOffsetTop = finiteNumber(summary && summary.offsetTop) || 0;
+    const xOffset = nonNegativeNumber(anchor && anchor.xOffset);
+    const yOffset = nonNegativeNumber(anchor && anchor.yOffset);
+    const safeXOffset = xOffset === null ? POSITION_INSET : xOffset;
+    const safeYOffset = yOffset === null ? POSITION_INSET : yOffset;
+    const summaryLeft =
+      anchor && anchor.xEdge === 'left'
+        ? safeXOffset
+        : viewportWidth - safeXOffset - summaryWidth;
+    const summaryTop =
+      anchor && anchor.yEdge === 'top'
+        ? safeYOffset
+        : viewportHeight - safeYOffset - summaryHeight;
+    return clampOverlayPosition(
+      {
+        left: summaryLeft - summaryOffsetLeft,
+        top: summaryTop - summaryOffsetTop,
+      },
+      viewport,
+      overlay,
+      inset,
+    );
+  }
+
+  function responsiveOverlayVerticalSide(
+    anchor,
+    summary,
+    requiredHeight,
+    viewport,
+    expanded = true,
+  ) {
+    const storedSide = anchor && anchor.verticalSide === 'up' ? 'up' : 'down';
+    if (!expanded) return storedSide;
+    const summaryWidth = Math.max(0, finiteNumber(summary && summary.width) || 0);
+    const summaryHeight = Math.max(0, finiteNumber(summary && summary.height) || 0);
+    const target = overlayPositionFromAnchor(
+      anchor,
+      viewport,
+      { width: summaryWidth, height: summaryHeight },
+      { width: summaryWidth, height: summaryHeight, offsetLeft: 0, offsetTop: 0 },
+      POSITION_INSET,
+    );
+    const viewportHeight = Math.max(0, finiteNumber(viewport && viewport.height) || 0);
+    const safeRequiredHeight = Math.max(0, finiteNumber(requiredHeight) || 0);
+    const spaceAbove = Math.max(0, target.top - POSITION_INSET);
+    const spaceBelow = Math.max(
+      0,
+      viewportHeight - target.top - summaryHeight - POSITION_INSET,
+    );
+    if (storedSide === 'up' && safeRequiredHeight <= spaceAbove) return 'up';
+    if (storedSide === 'down' && safeRequiredHeight <= spaceBelow) return 'down';
+    if (safeRequiredHeight <= spaceBelow) return 'down';
+    if (safeRequiredHeight <= spaceAbove) return 'up';
+    return spaceAbove > spaceBelow ? 'up' : 'down';
+  }
+
   function clampOverlayPosition(position, viewport, overlay, inset = POSITION_INSET) {
     const parsedInset = nonNegativeNumber(inset);
     const safeInset = parsedInset === null ? POSITION_INSET : parsedInset;
@@ -883,6 +1114,74 @@
       left: clamp(requestedLeft === null ? safeInset : requestedLeft, safeInset, maximumLeft),
       top: clamp(requestedTop === null ? safeInset : requestedTop, safeInset, maximumTop),
     };
+  }
+
+  function minimizedDockPosition(
+    composerRect,
+    orb,
+    viewport,
+    bottomInset = COMPOSER_DOCK_INSET,
+    viewportInset = POSITION_INSET,
+  ) {
+    const left = finiteNumber(composerRect && composerRect.left);
+    const top = finiteNumber(composerRect && composerRect.top);
+    const rawWidth = finiteNumber(composerRect && composerRect.width);
+    const rawHeight = finiteNumber(composerRect && composerRect.height);
+    const rawRight = finiteNumber(composerRect && composerRect.right);
+    const rawBottom = finiteNumber(composerRect && composerRect.bottom);
+    const width = rawWidth === null && left !== null && rawRight !== null
+      ? rawRight - left
+      : rawWidth;
+    const height = rawHeight === null && top !== null && rawBottom !== null
+      ? rawBottom - top
+      : rawHeight;
+    const orbWidth = Math.max(0, finiteNumber(orb && orb.width) || 0);
+    const orbHeight = Math.max(0, finiteNumber(orb && orb.height) || 0);
+    if (
+      left === null ||
+      top === null ||
+      width === null ||
+      height === null ||
+      width <= 0 ||
+      height <= 0 ||
+      orbWidth <= 0 ||
+      orbHeight <= 0
+    ) {
+      return null;
+    }
+
+    const right = rawRight === null ? left + width : rawRight;
+    const bottom = rawBottom === null ? top + height : rawBottom;
+    const parsedBottomInset = nonNegativeNumber(bottomInset);
+    const safeBottomInset = parsedBottomInset === null
+      ? COMPOSER_DOCK_INSET
+      : parsedBottomInset;
+    const innerInset = Math.min(6, Math.max(2, width / 8));
+    const minimumLeft = left + innerInset;
+    const maximumLeft = Math.max(minimumLeft, right - orbWidth - innerInset);
+    const minimumTop = top + Math.min(4, Math.max(0, height - orbHeight));
+    const maximumTop = Math.max(minimumTop, bottom - orbHeight - 4);
+    const insideComposer = {
+      left: clamp(left + (width - orbWidth) / 2, minimumLeft, maximumLeft),
+      top: clamp(bottom - orbHeight - safeBottomInset, minimumTop, maximumTop),
+    };
+    return clampOverlayPosition(
+      insideComposer,
+      viewport,
+      { width: orbWidth, height: orbHeight },
+      viewportInset,
+    );
+  }
+
+  function composerCandidateEligible(editorSignals, containerSignals) {
+    return Boolean(
+      (editorSignals && editorSignals.semantic) ||
+      (containerSignals && containerSignals.aiQualified),
+    );
+  }
+
+  function composerSemanticText(value) {
+    return typeof value === 'string' && COMPOSER_SEMANTIC_PATTERN.test(value);
   }
 
   function dragThresholdReached(previouslyDragged, start, current, threshold = DRAG_THRESHOLD) {
@@ -932,6 +1231,9 @@
     BILLING_ENDPOINT,
     CURRENT_ENDPOINT,
     LEGACY_ENDPOINT,
+    LEGACY_POSITION_KEY,
+    LEGACY_POSITION_KEY_PREFIX,
+    POSITION_KEY,
     activeFailureCanCommit,
     activeBillingStatus,
     activeBusinessTrial,
@@ -950,6 +1252,10 @@
     formatUpdated,
     isNotionPageUrl,
     clampOverlayPosition,
+    compactUsagePercent,
+    compactUsagePresentation,
+    composerCandidateEligible,
+    composerSemanticText,
     contextTokenMatches,
     cssColorTheme,
     currentUiLanguage,
@@ -957,17 +1263,28 @@
     dragPosition,
     dragThresholdReached,
     normalizeBillingStatus,
+    normalizeOverlayAnchor,
     normalizeVerdict,
     normalizeBusinessTrial,
+    overlayAnchorFromRect,
+    overlayPositionRecord,
+    overlayPositionFromAnchor,
+    orderedLegacyPositionEntries,
     percentage,
+    parseLegacyOverlayPosition,
+    parseLegacyV2OverlayPosition,
     parseOverlayPosition,
     planDisplayName,
     pollingInterval,
     preferredVerticalSide,
     mergeRecipeHeaders,
+    minimizedDockPosition,
     requestBodyText,
+    responsiveOverlayVerticalSide,
     responseSequenceIsFresh,
     safeHeaders,
+    serializeOverlayPosition,
+    selectStoredOverlayPosition,
     shouldBootstrapInFrame,
     subscriptionStatusText,
     summaryClickTransition,
@@ -1028,6 +1345,14 @@
     billingRefreshDueAt: 0,
     error: '',
     billingError: '',
+    positionError: '',
+    positionAnchor: null,
+    positionLoadStatus: 'unloaded',
+    positionRetryAt: 0,
+    pendingExternalAnchor: null,
+    dockFrame: null,
+    dockTimer: null,
+    dockLastScanAt: 0,
     ui: null,
   };
 
@@ -1040,7 +1365,7 @@
   }
 
   function currentErrorText() {
-    return [runtime.error, runtime.billingError]
+    return [runtime.error, runtime.billingError, runtime.positionError]
       .filter((message) => typeof message === 'string' && message.length > 0)
       .join(uiText('；', '; '));
   }
@@ -1063,37 +1388,73 @@
     };
   }
 
-  function persistOverlayPosition(position) {
-    const left = finiteNumber(position && position.left);
-    const top = finiteNumber(position && position.top);
-    if (left === null || top === null) return;
+  function persistOverlayPosition(anchor = runtime.positionAnchor) {
+    const normalized = normalizeOverlayAnchor(anchor, true);
+    if (!normalized || !runtime.ui) return false;
+    runtime.positionAnchor = normalized;
+    runtime.ui.positionAnchor = normalized;
+    runtime.pendingExternalAnchor = null;
+    runtime.positionLoadStatus = 'loaded';
+    const serialized = serializeOverlayPosition(normalized);
+    if (!serialized) return false;
     try {
-      const stored = { v: 1, left: Math.round(left), top: Math.round(top) };
-      const ui = runtime.ui;
-      if (ui && (ui.host.dataset.side === 'left' || ui.host.dataset.side === 'right')) {
-        stored.side = ui.host.dataset.side;
+      const hadPositionError = Boolean(runtime.positionError);
+      root.localStorage.setItem(POSITION_KEY, serialized);
+      if (root.localStorage.getItem(POSITION_KEY) !== serialized) {
+        runtime.positionError = uiText(
+          '位置未能写入网页本地存储。',
+          'Position could not be written to page localStorage.',
+        );
+        warn('Position storage verification failed; the current page may use ephemeral storage.');
+        render();
+        return false;
       }
-      if (
-        ui &&
-        (ui.host.dataset.verticalSide === 'up' ||
-          ui.host.dataset.verticalSide === 'down')
-      ) {
-        stored.verticalSide = ui.host.dataset.verticalSide;
-      }
-      root.localStorage.setItem(
-        POSITION_KEY,
-        JSON.stringify(stored),
-      );
+      runtime.positionError = '';
+      if (hadPositionError) render();
+      return true;
     } catch {
-      // Position persistence is optional.
+      runtime.positionError = uiText(
+        '此页面不允许保存悬浮窗位置。',
+        'This page does not allow the overlay position to be saved.',
+      );
+      warn('Position could not be saved to this page localStorage.');
+      render();
+      return false;
     }
+  }
+
+  function legacyV2StorageEntries(storage) {
+    const entries = [];
+    const seen = new Set();
+    const add = (key) => {
+      if (!legacyOverlayPositionScope(key) || seen.has(key)) return;
+      seen.add(key);
+      try {
+        entries.push({ key, raw: storage.getItem(key) });
+      } catch {
+        // Continue with any legacy candidates that remain readable.
+      }
+    };
+    try {
+      const length = Math.max(0, Math.floor(finiteNumber(storage.length) || 0));
+      for (let index = 0; index < length; index += 1) add(storage.key(index));
+    } catch {
+      // Some storage proxies do not expose key enumeration.
+    }
+    add(`${LEGACY_POSITION_KEY_PREFIX}embedded`);
+    add(`${LEGACY_POSITION_KEY_PREFIX}top`);
+    return entries;
   }
 
   function storedOverlayPosition() {
     try {
-      return parseOverlayPosition(root.localStorage.getItem(POSITION_KEY));
+      return selectStoredOverlayPosition(
+        root.localStorage.getItem(POSITION_KEY),
+        legacyV2StorageEntries(root.localStorage),
+        root.localStorage.getItem(LEGACY_POSITION_KEY),
+      );
     } catch {
-      return null;
+      return { kind: 'unavailable' };
     }
   }
 
@@ -1115,7 +1476,6 @@
   function applyOverlayPosition(position, options = {}) {
     const ui = runtime.ui;
     if (!ui) return null;
-    const previousPosition = ui.position;
     const rect = ui.host.getBoundingClientRect();
     const viewport = viewportSize();
     const clamped = clampOverlayPosition(
@@ -1140,71 +1500,672 @@
             { left: normalized.left, width: rect.width },
             viewport,
           );
+    return normalized;
+  }
+
+  function composerAttributeText(element) {
+    if (!element || typeof element.getAttribute !== 'function') return '';
+    const names = [
+      'aria-label',
+      'aria-placeholder',
+      'placeholder',
+      'data-placeholder',
+      'data-testid',
+      'id',
+      'class',
+    ];
+    return names
+      .map((name) => element.getAttribute(name) || '')
+      .join(' ')
+      .slice(0, 1200);
+  }
+
+  function visibleElementRect(element, options = {}) {
+    if (!element || element.isConnected === false || typeof element.getBoundingClientRect !== 'function') {
+      return null;
+    }
+    try {
+      if (
+        typeof element.closest === 'function' &&
+        element.closest('[aria-hidden="true"], [inert]')
+      ) {
+        return null;
+      }
+    } catch {
+      // Visibility can still be established from layout and computed style.
+    }
+    try {
+      if (typeof root.getComputedStyle === 'function') {
+        const style = root.getComputedStyle(element);
+        const opacity = finiteNumber(style && style.opacity);
+        if (
+          !style ||
+          style.display === 'none' ||
+          style.visibility === 'hidden' ||
+          style.contentVisibility === 'hidden' ||
+          (opacity !== null && opacity <= 0.02)
+        ) {
+          return null;
+        }
+      }
+    } catch {
+      // A usable client rect is enough when computed style is unavailable.
+    }
+    const rect = element.getBoundingClientRect();
+    const width = Math.max(0, finiteNumber(rect && rect.width) || 0);
+    const height = Math.max(0, finiteNumber(rect && rect.height) || 0);
+    const left = finiteNumber(rect && rect.left);
+    const top = finiteNumber(rect && rect.top);
+    if (left === null || top === null || width <= 0 || height <= 0) return null;
+    const right = finiteNumber(rect && rect.right);
+    const bottom = finiteNumber(rect && rect.bottom);
+    const normalized = {
+      left,
+      top,
+      right: right === null ? left + width : right,
+      bottom: bottom === null ? top + height : bottom,
+      width,
+      height,
+    };
+    const viewport = viewportSize();
+    const minimumWidth = Math.max(0, finiteNumber(options.minimumWidth) || 0);
+    const maximumHeight = finiteNumber(options.maximumHeight);
     if (
-      options.persist &&
-      (!previousPosition ||
-        previousPosition.left !== normalized.left ||
-        previousPosition.top !== normalized.top)
+      width < minimumWidth ||
+      (maximumHeight !== null && height > maximumHeight) ||
+      normalized.right <= 0 ||
+      normalized.bottom <= 0 ||
+      normalized.left >= viewport.width ||
+      normalized.top >= viewport.height
     ) {
-      persistOverlayPosition(normalized);
+      return null;
     }
     return normalized;
   }
 
-  function restoreOverlayPosition() {
-    const position = storedOverlayPosition();
-    if (!position || !runtime.ui) return;
-    if (position.side === 'left' || position.side === 'right') {
-      runtime.ui.host.dataset.side = position.side;
-    }
-    if (position.verticalSide === 'up' || position.verticalSide === 'down') {
-      runtime.ui.host.dataset.verticalSide = position.verticalSide;
-    }
-    applyOverlayPosition(position, { persist: true, side: position.side });
+  function composerEditorSignals(editor) {
+    const tagName = String(editor && editor.tagName || '').toLowerCase();
+    const role = editor && typeof editor.getAttribute === 'function'
+      ? editor.getAttribute('role')
+      : '';
+    const semantic = composerSemanticText(composerAttributeText(editor));
+    const lexical = Boolean(
+      editor &&
+      typeof editor.hasAttribute === 'function' &&
+      editor.hasAttribute('data-lexical-editor'),
+    );
+    return {
+      semantic,
+      lexical,
+      textarea: tagName === 'textarea',
+      textbox: role === 'textbox',
+    };
   }
 
-  function keepOverlayInViewport(persist = false) {
-    if (!runtime.ui || !runtime.ui.position) return;
-    applyOverlayPosition(runtime.ui.position, {
-      persist,
-      side: runtime.ui.host.dataset.side,
+  function isNotionAiRoute() {
+    try {
+      const pathname =
+        typeof root.location.pathname === 'string'
+          ? root.location.pathname
+          : new URL(root.location.href).pathname;
+      return /^\/ai(?:\/|$)/.test(pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function composerVisualSurface(element, rect, editorRect) {
+    const viewport = viewportSize();
+    if (
+      !element ||
+      !rect ||
+      rect.width < 260 ||
+      rect.height < 50 ||
+      rect.height > 220 ||
+      rect.width > viewport.width * 0.92 ||
+      rect.height > viewport.height * 0.4 ||
+      editorRect.left < rect.left - 4 ||
+      editorRect.right > rect.right + 4 ||
+      editorRect.top < rect.top - 4 ||
+      editorRect.bottom > rect.bottom + 4
+    ) {
+      return false;
+    }
+    let style;
+    try {
+      style = root.getComputedStyle(element);
+    } catch {
+      return false;
+    }
+    const radius = Number.parseFloat(style && style.borderRadius) || 0;
+    const borderWidth = Number.parseFloat(style && style.borderTopWidth) || 0;
+    const background = String(style && style.backgroundColor || '').replace(/\s+/g, '');
+    const hasBackground =
+      background.length > 0 &&
+      background !== 'transparent' &&
+      background !== 'rgba(0,0,0,0)';
+    const hasSurface =
+      radius >= 6 &&
+      (borderWidth > 0 ||
+        (style && style.boxShadow && style.boxShadow !== 'none') ||
+        (style && style.outlineStyle && style.outlineStyle !== 'none') ||
+        hasBackground);
+    const centerDistance = Math.abs(rect.left + rect.width / 2 - viewport.width / 2);
+    const nearPageCenter = centerDistance < viewport.width * 0.3;
+    const avoidsSidebar = viewport.width < 700 || rect.left > Math.min(360, viewport.width * 0.34);
+    let inAiSurface = false;
+    try {
+      inAiSurface = Boolean(
+        typeof element.closest === 'function' && element.closest('[role="dialog"], aside'),
+      );
+    } catch {
+      // Geometry remains the primary surface signal.
+    }
+    return hasSurface && ((nearPageCenter && avoidsSidebar) || inAiSurface);
+  }
+
+  function composerButtonSignal(container) {
+    if (!container || typeof container.querySelectorAll !== 'function') {
+      return { any: false, send: false };
+    }
+    let buttons;
+    try {
+      buttons = Array.from(container.querySelectorAll('button, [role="button"]')).slice(0, 36);
+    } catch {
+      return { any: false, send: false };
+    }
+    let any = false;
+    for (const button of buttons) {
+      if (!visibleElementRect(button)) continue;
+      any = true;
+      const type = typeof button.getAttribute === 'function'
+        ? button.getAttribute('type')
+        : '';
+      const text = `${composerAttributeText(button)} ${button.textContent || ''}`.slice(0, 800);
+      if (type === 'submit' || COMPOSER_SEND_PATTERN.test(text)) {
+        return { any: true, send: true };
+      }
+    }
+    return { any, send: false };
+  }
+
+  function composerContainerForEditor(editor, editorRect) {
+    let current = editor;
+    let sawAiSemantic = composerSemanticText(composerAttributeText(editor));
+    let best = {
+      element: editor,
+      rect: editorRect,
+      score: 0,
+      aiQualified: sawAiSemantic,
+    };
+    for (let depth = 0; current && depth < 8; depth += 1) {
+      const rect = visibleElementRect(current, {
+        minimumWidth: Math.max(160, editorRect.width - 8),
+        maximumHeight: 320,
+      });
+      if (rect) {
+        const attributes = composerAttributeText(current);
+        const semantic = composerSemanticText(attributes);
+        if (semantic) sawAiSemantic = true;
+        const structural = COMPOSER_STRUCTURE_PATTERN.test(attributes);
+        const tagName = String(current.tagName || '').toLowerCase();
+        const buttons = composerButtonSignal(current);
+        const visualSurface = composerVisualSurface(current, rect, editorRect);
+        const bottomSpace = Math.max(0, rect.bottom - editorRect.bottom);
+        const horizontalSpace = Math.max(0, rect.width - editorRect.width);
+        let score = depth === 0 ? 0 : 8;
+        if (semantic) score += 76;
+        else if (structural) score += 10;
+        if (visualSurface) score += 58;
+        if (tagName === 'form') score += 54;
+        if (buttons.send) score += 70;
+        else if (buttons.any) score += 12;
+        if (bottomSpace >= 24 && bottomSpace <= 110) score += 30;
+        else if (bottomSpace >= 8 && bottomSpace <= 150) score += 16;
+        if (horizontalSpace >= 8 && horizontalSpace <= 280) score += 12;
+        if (rect.height >= 48 && rect.height <= 220) score += 14;
+        if (rect.width > editorRect.width + 480) score -= 24;
+        score -= depth;
+        if (score > best.score) {
+          best = {
+            element: current,
+            rect,
+            score,
+            aiQualified: semantic || (isNotionAiRoute() && visualSurface),
+          };
+        }
+      }
+      if (current === root.document.body || !current.parentElement) break;
+      current = current.parentElement;
+    }
+    if (sawAiSemantic) best.aiQualified = true;
+    return best;
+  }
+
+  function findNotionAiComposer(ui = runtime.ui) {
+    if (!ui || !root.document || typeof root.document.querySelectorAll !== 'function') return null;
+    const activeElement = root.document.activeElement;
+    if (ui.dockComposer && ui.dockEditor) {
+      const editorRect = visibleElementRect(ui.dockEditor, {
+        minimumWidth: 180,
+        maximumHeight: 240,
+      });
+      const composerRect = visibleElementRect(ui.dockComposer, {
+        minimumWidth: 180,
+        maximumHeight: 320,
+      });
+      const activeSignals = composerEditorSignals(activeElement);
+      const activeIsAnotherComposer =
+        activeElement &&
+        activeElement !== ui.host &&
+        !(typeof ui.host.contains === 'function' && ui.host.contains(activeElement)) &&
+        activeElement !== ui.dockEditor &&
+        activeSignals.semantic;
+      if (editorRect && composerRect && !activeIsAnotherComposer) {
+        return { editor: ui.dockEditor, element: ui.dockComposer, rect: composerRect };
+      }
+    }
+
+    let editorNodes;
+    try {
+      editorNodes = Array.from(root.document.querySelectorAll(COMPOSER_EDITOR_SELECTOR));
+    } catch {
+      return null;
+    }
+    if (editorNodes.length > 240) {
+      editorNodes = editorNodes.slice(0, 32).concat(editorNodes.slice(-208));
+    }
+    if (activeElement && !editorNodes.includes(activeElement)) {
+      const activeSignals = composerEditorSignals(activeElement);
+      if (
+        activeSignals.semantic ||
+        activeSignals.textarea ||
+        activeSignals.textbox ||
+        activeSignals.lexical
+      ) {
+        editorNodes.push(activeElement);
+      }
+    }
+
+    const viewport = viewportSize();
+    let selected = null;
+    for (const editor of editorNodes) {
+      if (editor === ui.host || (typeof ui.host.contains === 'function' && ui.host.contains(editor))) {
+        continue;
+      }
+      if (editor.disabled || editor.readOnly) continue;
+      const editorRect = visibleElementRect(editor, {
+        minimumWidth: 180,
+        maximumHeight: 240,
+      });
+      if (!editorRect || editorRect.bottom < viewport.height * 0.35) continue;
+      const signals = composerEditorSignals(editor);
+      const container = composerContainerForEditor(editor, editorRect);
+      if (!composerCandidateEligible(signals, container)) {
+        continue;
+      }
+      const active =
+        activeElement === editor ||
+        (typeof editor.contains === 'function' && editor.contains(activeElement));
+      let score = container.score;
+      if (signals.semantic) score += 110;
+      if (signals.textarea) score += 48;
+      if (signals.textbox) score += 44;
+      if (signals.lexical) score += 24;
+      if (active) score += 130;
+      score += clamp((editorRect.bottom / Math.max(1, viewport.height)) * 44, 0, 44);
+      score += clamp((editorRect.width / Math.max(1, viewport.width)) * 18, 0, 18);
+      try {
+        if (typeof editor.closest === 'function' && editor.closest('[role="dialog"], aside')) {
+          score += 16;
+        }
+      } catch {
+        // Dialog context is only a ranking hint.
+      }
+      if (!selected || score > selected.score) {
+        selected = {
+          editor,
+          element: container.element,
+          rect: container.rect,
+          score,
+        };
+      }
+    }
+    return selected;
+  }
+
+  function disconnectComposerResizeObserver(ui) {
+    if (ui && ui.dockResizeObserver) {
+      ui.dockResizeObserver.disconnect();
+      ui.dockResizeObserver = null;
+    }
+  }
+
+  function observeDockMutationTarget(ui, target) {
+    if (!ui || !ui.dockMutationObserver || !target || ui.dockMutationTarget === target) return;
+    ui.dockMutationObserver.disconnect();
+    ui.dockMutationObserver.observe(target, { childList: true, subtree: true });
+    ui.dockMutationTarget = target;
+  }
+
+  function watchDockComposer(ui, match) {
+    if (!ui || !match) return;
+    if (ui.dockComposer === match.element && ui.dockEditor === match.editor) return;
+    disconnectComposerResizeObserver(ui);
+    ui.dockComposer = match.element;
+    ui.dockEditor = match.editor;
+    const parent = match.element.parentElement;
+    observeDockMutationTarget(ui, (parent && parent.parentElement) || parent || match.element);
+    if (typeof root.ResizeObserver !== 'function') return;
+    ui.dockResizeObserver = new root.ResizeObserver(() => {
+      if (runtime.ui === ui && ui.minimized) scheduleMinimizedDock();
     });
+    ui.dockResizeObserver.observe(match.element);
+  }
+
+  function clearComposerDock(ui, clearTarget = true) {
+    if (!ui) return;
+    if (typeof ui.host.removeAttribute === 'function') {
+      ui.host.removeAttribute('data-docked');
+    } else if (ui.host.dataset) {
+      delete ui.host.dataset.docked;
+    }
+    if (!clearTarget) return;
+    disconnectComposerResizeObserver(ui);
+    ui.dockComposer = null;
+    ui.dockEditor = null;
+    ui.dockMutationTarget = null;
+    if (ui.minimized && root.document.body) {
+      observeDockMutationTarget(ui, root.document.body);
+    }
+  }
+
+  function dockMinimizedOverlay() {
+    const ui = runtime.ui;
+    if (!ui || !ui.minimized || ui.dragActive) return null;
+    const match = findNotionAiComposer(ui);
+    if (!match) {
+      clearComposerDock(ui);
+      return null;
+    }
+    const orbRect = ui.orb.getBoundingClientRect();
+    const position = minimizedDockPosition(
+      match.rect,
+      { width: orbRect.width, height: orbRect.height },
+      viewportSize(),
+    );
+    if (!position) {
+      clearComposerDock(ui);
+      return null;
+    }
+    watchDockComposer(ui, match);
+    ui.host.dataset.docked = 'composer';
+    ui.host.dataset.verticalSide = 'down';
+    return applyOverlayPosition(position);
+  }
+
+  function scheduleMinimizedDock(delayMs = 0) {
+    const ui = runtime.ui;
+    if (!ui || !ui.minimized || ui.dragActive) return;
+    const requestedDelay = Math.max(0, finiteNumber(delayMs) || 0);
+    const elapsedSinceScan = Date.now() - runtime.dockLastScanAt;
+    const cooldownDelay = ui.dockComposer
+      ? 0
+      : Math.max(0, COMPOSER_SCAN_COOLDOWN_MS - elapsedSinceScan);
+    const delay = Math.max(requestedDelay, cooldownDelay);
+    if (delay > 0) {
+      if (runtime.dockTimer !== null) return;
+      runtime.dockTimer = root.setTimeout(() => {
+        runtime.dockTimer = null;
+        scheduleMinimizedDock();
+      }, delay);
+      return;
+    }
+    if (runtime.dockFrame !== null) return;
+    const run = () => {
+      runtime.dockFrame = null;
+      if (runtime.ui === ui && ui.minimized && !ui.dragActive) {
+        runtime.dockLastScanAt = Date.now();
+        keepOverlayInViewport();
+      }
+    };
+    if (typeof root.requestAnimationFrame === 'function') {
+      runtime.dockFrame = root.requestAnimationFrame(run);
+    } else {
+      runtime.dockFrame = root.setTimeout(run, 16);
+    }
+  }
+
+  function startDockTracking(ui) {
+    if (!ui || !ui.minimized || ui.dockMutationObserver || !root.document.body) return;
+    runtime.dockLastScanAt = 0;
+    if (typeof root.MutationObserver !== 'function') return;
+    ui.dockMutationObserver = new root.MutationObserver(() => {
+      if (runtime.ui === ui && ui.minimized) scheduleMinimizedDock(120);
+    });
+    observeDockMutationTarget(ui, root.document.body);
+  }
+
+  function stopDockTracking(ui) {
+    if (!ui) return;
+    if (ui.dockMutationObserver) {
+      ui.dockMutationObserver.disconnect();
+      ui.dockMutationObserver = null;
+    }
+    ui.dockMutationTarget = null;
+    runtime.dockLastScanAt = 0;
+    clearComposerDock(ui);
+  }
+
+  function overlayPositionHandle(ui = runtime.ui) {
+    return ui && ui.minimized ? ui.orb : ui && ui.summary;
+  }
+
+  function applyOverlayAnchor(anchor) {
+    const ui = runtime.ui;
+    const normalized = normalizeOverlayAnchor(anchor);
+    if (!ui || !normalized) return null;
+    runtime.positionAnchor = normalized;
+    ui.positionAnchor = normalized;
+    if (ui.minimized) {
+      const docked = dockMinimizedOverlay();
+      if (docked) return docked;
+    }
+    ui.host.dataset.side = normalized.side;
+    const viewport = viewportSize();
+    const handle = overlayPositionHandle(ui);
+    const handleSize = handle.getBoundingClientRect();
+    const cardHeight = ui.expanded && !ui.minimized
+      ? ui.card.getBoundingClientRect().height + 7
+      : 0;
+    ui.host.dataset.verticalSide = responsiveOverlayVerticalSide(
+      normalized,
+      { width: handleSize.width, height: handleSize.height },
+      cardHeight,
+      viewport,
+      ui.expanded && !ui.minimized,
+    );
+    const hostRect = ui.host.getBoundingClientRect();
+    const handleRect = handle.getBoundingClientRect();
+    const position = overlayPositionFromAnchor(
+      normalized,
+      viewport,
+      { width: hostRect.width, height: hostRect.height },
+      {
+        width: handleRect.width,
+        height: handleRect.height,
+        offsetLeft: handleRect.left - hostRect.left,
+        offsetTop: handleRect.top - hostRect.top,
+      },
+      POSITION_INSET,
+    );
+    return applyOverlayPosition(position, { side: normalized.side });
+  }
+
+  function anchorFromCurrentOverlay(preferredXEdge = null, preferredYEdge = null) {
+    const ui = runtime.ui;
+    if (!ui) return null;
+    const handleRect = overlayPositionHandle(ui).getBoundingClientRect();
+    const viewport = viewportSize();
+    const edges = overlayAnchorFromRect(
+      handleRect,
+      viewport,
+      preferredXEdge,
+      preferredYEdge,
+    );
+    return {
+      ...edges,
+      side: overlaySide(handleRect, viewport),
+      verticalSide: edges.yEdge === 'bottom' ? 'up' : 'down',
+    };
+  }
+
+  function restoreOverlayPosition(force = false) {
+    const ui = runtime.ui;
+    if (!ui) return;
+    if (runtime.positionAnchor && !force) {
+      applyOverlayAnchor(runtime.positionAnchor);
+      return;
+    }
+    const stored = storedOverlayPosition();
+    if (stored && stored.kind === 'unavailable') {
+      const firstFailure = runtime.positionLoadStatus !== 'failed';
+      runtime.positionLoadStatus = 'failed';
+      runtime.positionRetryAt = Date.now() + 5000;
+      runtime.positionError = uiText(
+        '暂时无法读取网页保存的位置，将自动重试。',
+        'Saved page position is temporarily unavailable; retrying automatically.',
+      );
+      if (firstFailure) warn('Position could not be read from this page localStorage.');
+      if (!runtime.positionAnchor) {
+        const fallback = anchorFromCurrentOverlay();
+        if (fallback) applyOverlayAnchor(fallback);
+      }
+      return;
+    }
+    runtime.positionLoadStatus = 'loaded';
+    runtime.positionRetryAt = 0;
+    runtime.positionError = '';
+    if (stored && stored.kind === 'anchor') {
+      applyOverlayAnchor(stored.anchor);
+      return;
+    }
+
+    if (!stored) {
+      const anchor = anchorFromCurrentOverlay();
+      if (anchor) applyOverlayAnchor(anchor);
+      return;
+    }
+
+    const position = stored.position;
+    if (position.side === 'left' || position.side === 'right') {
+      ui.host.dataset.side = position.side;
+    }
+    if (position.verticalSide === 'up' || position.verticalSide === 'down') {
+      ui.host.dataset.verticalSide = position.verticalSide;
+    }
+    applyOverlayPosition(position, { side: position.side });
+    const anchor = anchorFromCurrentOverlay(
+      position.side === 'left' || position.side === 'right' ? position.side : null,
+      position.verticalSide === 'up'
+        ? 'bottom'
+        : position.verticalSide === 'down'
+          ? 'top'
+          : null,
+    );
+    if (!anchor) return;
+    anchor.side = ui.host.dataset.side === 'left' ? 'left' : 'right';
+    if (position.verticalSide === 'up' || position.verticalSide === 'down') {
+      anchor.verticalSide = position.verticalSide;
+    }
+    applyOverlayAnchor(anchor);
+  }
+
+  function keepOverlayInViewport() {
+    const ui = runtime.ui;
+    if (!ui || ui.dragActive) return;
+    if (ui.minimized) {
+      const docked = dockMinimizedOverlay();
+      if (docked) return;
+    }
+    if (!ui.positionAnchor) return;
+    applyOverlayAnchor(ui.positionAnchor);
+  }
+
+  function handleOverlayPositionStorage(event) {
+    const ui = runtime.ui;
+    if (!ui || !event || event.key !== POSITION_KEY) return;
+    const raw = event.newValue;
+    const anchor = parseOverlayPosition(raw);
+    if (!anchor) return;
+    try {
+      // A delayed storage event must not roll the UI back after a newer write.
+      if (root.localStorage.getItem(POSITION_KEY) !== raw) return;
+    } catch {
+      return;
+    }
+    if (ui.dragActive) {
+      runtime.pendingExternalAnchor = { anchor, raw };
+      return;
+    }
+    runtime.pendingExternalAnchor = null;
+    runtime.positionLoadStatus = 'loaded';
+    runtime.positionError = '';
+    applyOverlayAnchor(anchor);
+  }
+
+  function applyPendingExternalAnchor() {
+    const pending = runtime.pendingExternalAnchor;
+    runtime.pendingExternalAnchor = null;
+    if (!pending || !runtime.ui || runtime.ui.dragActive) return;
+    try {
+      if (root.localStorage.getItem(POSITION_KEY) !== pending.raw) return;
+    } catch {
+      return;
+    }
+    applyOverlayAnchor(pending.anchor);
   }
 
   function setExpanded(expanded) {
     if (!runtime.ui) return;
     const ui = runtime.ui;
     const nextExpanded = Boolean(expanded);
-    const positionBefore = ui.position ? { ...ui.position } : null;
-    const summaryBefore = positionBefore ? ui.summary.getBoundingClientRect() : null;
-    const side = summaryBefore ? overlaySide(summaryBefore) : null;
-    if (side) ui.host.dataset.side = side;
+    const anchor = ui.positionAnchor ? { ...ui.positionAnchor } : null;
 
     ui.expanded = nextExpanded;
-    ui.card.hidden = !nextExpanded;
-    ui.summary.setAttribute('aria-expanded', String(nextExpanded));
+    ui.card.hidden = ui.minimized || !nextExpanded;
+    ui.summaryToggle.setAttribute('aria-expanded', String(nextExpanded));
     ui.chevron.textContent = nextExpanded ? '▴' : '▾';
 
-    if (positionBefore && summaryBefore) {
-      if (nextExpanded) {
-        const cardHeight = ui.card.getBoundingClientRect().height;
-        ui.host.dataset.verticalSide = preferredVerticalSide(
-          summaryBefore,
-          cardHeight + 7,
-        );
-      }
-      const summaryAfter = ui.summary.getBoundingClientRect();
-      applyOverlayPosition(
-        {
-          left: positionBefore.left + summaryBefore.left - summaryAfter.left,
-          top: positionBefore.top + summaryBefore.top - summaryAfter.top,
-        },
-        { persist: true, side },
-      );
-      persistOverlayPosition(ui.position);
-    }
+    if (anchor) applyOverlayAnchor(anchor);
     try {
       root.localStorage.setItem(EXPANDED_KEY, nextExpanded ? '1' : '0');
+    } catch {
+      // Preference persistence is optional.
+    }
+  }
+
+  function setMinimized(minimized, persist = true) {
+    const ui = runtime.ui;
+    if (!ui) return;
+    const nextMinimized = Boolean(minimized);
+    const anchor = runtime.positionAnchor ? { ...runtime.positionAnchor } : null;
+    ui.minimized = nextMinimized;
+    ui.shell.dataset.minimized = String(nextMinimized);
+    ui.orb.hidden = !nextMinimized;
+    ui.summary.hidden = nextMinimized;
+    ui.card.hidden = nextMinimized || !ui.expanded;
+    if (nextMinimized) {
+      startDockTracking(ui);
+      if (!dockMinimizedOverlay() && anchor) applyOverlayAnchor(anchor);
+      scheduleMinimizedDock();
+    } else {
+      stopDockTracking(ui);
+      if (anchor) applyOverlayAnchor(anchor);
+    }
+    if (!persist) return;
+    try {
+      root.localStorage.setItem(MINIMIZED_KEY, nextMinimized ? '1' : '0');
     } catch {
       // Preference persistence is optional.
     }
@@ -1219,118 +2180,307 @@
     );
   }
 
-  function installDragHandle(handle, options = {}) {
-    const ui = runtime.ui;
-    if (!ui || !handle) return;
-    let activeDrag = null;
+  function installOverlayDragging(ui) {
+    if (!ui) return;
+    let session = null;
 
-    const finishDrag = (event, canceled) => {
-      if (!activeDrag || event.pointerId !== activeDrag.pointerId) return;
-      const completedDrag = activeDrag;
-      activeDrag = null;
-      ui.shell.removeAttribute('data-dragging');
-      if (completedDrag.dragged && ui.position) {
-        if (event.cancelable) event.preventDefault();
-        const finalSide = overlaySide(
-          options.suppressClick
-            ? ui.summary.getBoundingClientRect()
-            : ui.host.getBoundingClientRect(),
-        );
-        if (ui.host.dataset.side !== finalSide) {
-          const summaryBefore = options.suppressClick
-            ? ui.summary.getBoundingClientRect()
-            : null;
-          ui.host.dataset.side = finalSide;
-          if (summaryBefore) {
-            const summaryAfter = ui.summary.getBoundingClientRect();
-            applyOverlayPosition(
-              {
-                left: ui.position.left + summaryBefore.left - summaryAfter.left,
-                top: ui.position.top + summaryBefore.top - summaryAfter.top,
-              },
-              { side: finalSide },
-            );
-          }
-        }
-        persistOverlayPosition(ui.position);
-        if (!canceled && options.suppressClick) {
-          ui.suppressSummaryClick = true;
-          root.setTimeout(() => {
-            if (runtime.ui === ui) ui.suppressSummaryClick = false;
-          }, 500);
-        }
-      }
-      try {
-        if (
-          typeof handle.hasPointerCapture === 'function' &&
-          handle.hasPointerCapture(completedDrag.pointerId)
-        ) {
-          handle.releasePointerCapture(completedDrag.pointerId);
-        }
-      } catch {
-        // The browser may already have released capture during cancellation.
-      }
+    const removeRootListeners = () => {
+      root.removeEventListener('pointermove', rootPointerMove, true);
+      root.removeEventListener('pointerup', rootPointerUp, true);
+      root.removeEventListener('pointercancel', rootPointerCancel, true);
+      root.removeEventListener('blur', rootBlur);
+    };
+    const addRootListeners = () => {
+      root.addEventListener('pointermove', rootPointerMove, true);
+      root.addEventListener('pointerup', rootPointerUp, true);
+      root.addEventListener('pointercancel', rootPointerCancel, true);
+      root.addEventListener('blur', rootBlur);
     };
 
-    handle.addEventListener('pointerdown', (event) => {
-      if (activeDrag || event.isPrimary === false || event.button !== 0) return;
+    function finishDrag(event, canceled) {
+      if (!session) return;
+      if (
+        event &&
+        typeof event.pointerId === 'number' &&
+        event.pointerId !== session.pointerId
+      ) {
+        return;
+      }
+      const completed = session;
+      session = null;
+      removeRootListeners();
+      ui.dragActive = false;
+      ui.shell.removeAttribute('data-dragging');
+      try {
+        if (
+          typeof completed.handle.hasPointerCapture === 'function' &&
+          completed.handle.hasPointerCapture(completed.pointerId)
+        ) {
+          completed.handle.releasePointerCapture(completed.pointerId);
+        }
+      } catch {
+        // Pointer capture may already have been released by the browser.
+      }
+      if (runtime.ui !== ui) {
+        applyPendingExternalAnchor();
+        return;
+      }
+      if (!completed.dragged) {
+        applyPendingExternalAnchor();
+        return;
+      }
+      if (event && event.cancelable) event.preventDefault();
+      if (canceled) {
+        if (completed.anchor) {
+          applyOverlayAnchor(completed.anchor);
+        } else {
+          applyOverlayPosition(completed.origin, { side: completed.side });
+        }
+        applyPendingExternalAnchor();
+        return;
+      }
+
+      runtime.pendingExternalAnchor = null;
+      const handleRect = overlayPositionHandle(ui).getBoundingClientRect();
+      const viewport = viewportSize();
+      const edges = overlayAnchorFromRect(handleRect, viewport);
+      const cardHeight = ui.expanded && !ui.minimized
+        ? ui.card.getBoundingClientRect().height
+        : 0;
+      const anchor = {
+        ...edges,
+        side: overlaySide(handleRect, viewport),
+        verticalSide: ui.expanded && !ui.minimized
+          ? preferredVerticalSide(handleRect, cardHeight + 7, viewport)
+          : edges.yEdge === 'bottom'
+            ? 'up'
+            : 'down',
+      };
+      applyOverlayAnchor(anchor);
+      persistOverlayPosition(anchor);
+      if (completed.suppressClick) {
+        ui.suppressSummaryClick = true;
+        root.setTimeout(() => {
+          if (runtime.ui === ui) ui.suppressSummaryClick = false;
+        }, 500);
+      }
+    }
+
+    function rootPointerMove(event) {
+      if (!session) return;
+      if (runtime.ui !== ui) {
+        finishDrag(null, true);
+        return;
+      }
+      if (event.pointerId !== session.pointerId) return;
+      const current = { x: event.clientX, y: event.clientY };
+      session.dragged = dragThresholdReached(
+        session.dragged,
+        session.start,
+        current,
+        DRAG_THRESHOLD,
+      );
+      if (!session.dragged) return;
+      if (event.cancelable) event.preventDefault();
+      ui.shell.dataset.dragging = 'true';
+      applyOverlayPosition(
+        dragPosition(
+          session.origin,
+          session.start,
+          current,
+          viewportSize(),
+          session.size,
+          POSITION_INSET,
+        ),
+        { side: session.side },
+      );
+    }
+
+    function rootPointerUp(event) {
+      finishDrag(event, false);
+    }
+
+    function rootPointerCancel(event) {
+      finishDrag(event, true);
+    }
+
+    function rootBlur() {
+      finishDrag(null, true);
+    }
+
+    const startDrag = (handle, options, event) => {
+      if (
+        session ||
+        ui.dragActive ||
+        ui.minimized ||
+        runtime.ui !== ui ||
+        event.isPrimary === false ||
+        event.button !== 0
+      ) {
+        return;
+      }
       if (options.ignoreInteractive && interactiveDragTarget(event.target)) return;
+      if (
+        options.ignoreSelector &&
+        event.target &&
+        typeof event.target.closest === 'function' &&
+        event.target.closest(options.ignoreSelector)
+      ) {
+        return;
+      }
       if (options.suppressClick) ui.suppressSummaryClick = false;
       const rect = ui.host.getBoundingClientRect();
-      activeDrag = {
+      session = {
+        handle,
         pointerId: event.pointerId,
         origin: { left: rect.left, top: rect.top },
         start: { x: event.clientX, y: event.clientY },
         size: { width: rect.width, height: rect.height },
+        anchor: ui.positionAnchor ? { ...ui.positionAnchor } : null,
+        suppressClick: Boolean(options.suppressClick),
         side:
           ui.host.dataset.side === 'left' || ui.host.dataset.side === 'right'
             ? ui.host.dataset.side
-            : overlaySide(ui.summary.getBoundingClientRect()),
+            : overlaySide(overlayPositionHandle(ui).getBoundingClientRect()),
         dragged: false,
       };
+      ui.dragActive = true;
+      addRootListeners();
       try {
         if (typeof handle.setPointerCapture === 'function') {
           handle.setPointerCapture(event.pointerId);
         }
       } catch {
-        // Pointer capture is an enhancement; keep the normal pointer stream intact.
+        // Root listeners still provide a fallback when capture is unavailable.
       }
-    });
+    };
 
-    handle.addEventListener('pointermove', (event) => {
-      if (!activeDrag || event.pointerId !== activeDrag.pointerId) return;
-      const current = { x: event.clientX, y: event.clientY };
-      activeDrag.dragged = dragThresholdReached(
-        activeDrag.dragged,
-        activeDrag.start,
-        current,
-        DRAG_THRESHOLD,
-      );
-      if (!activeDrag.dragged) return;
-      if (event.cancelable) event.preventDefault();
-      ui.shell.dataset.dragging = 'true';
-      applyOverlayPosition(
-        dragPosition(
-          activeDrag.origin,
-          activeDrag.start,
-          current,
-          viewportSize(),
-          activeDrag.size,
-          POSITION_INSET,
-        ),
-        { side: activeDrag.side },
-      );
-    });
-
-    handle.addEventListener('pointerup', (event) => finishDrag(event, false));
-    handle.addEventListener('pointercancel', (event) => finishDrag(event, true));
-    handle.addEventListener('lostpointercapture', (event) => finishDrag(event, true));
+    const handles = [
+      {
+        handle: ui.summary,
+        options: { suppressClick: true, ignoreSelector: '.summary-minimize' },
+      },
+      { handle: ui.header, options: { ignoreInteractive: true } },
+    ];
+    for (const { handle, options } of handles) {
+      handle.addEventListener('pointerdown', (event) => startDrag(handle, options, event));
+      handle.addEventListener('lostpointercapture', (event) => finishDrag(event, true));
+    }
   }
 
   function metricTone(percent) {
     if (percent >= 90) return 'danger';
     if (percent >= 70) return 'warning';
     return 'normal';
+  }
+
+  function compactUsagePercent(snapshot, nowMs = Date.now()) {
+    if (!snapshot || snapshot.status === 'not_applicable') return null;
+    const values = [];
+    const rolling = finiteNumber(snapshot.rolling && snapshot.rolling.percent);
+    if (rolling !== null) values.push(clamp(rolling, 0, 100));
+    const monthly = finiteNumber(snapshot.monthly && snapshot.monthly.percent);
+    if (
+      monthly !== null &&
+      finiteNumber(snapshot.monthly && snapshot.monthly.resetAt) > nowMs
+    ) {
+      values.push(clamp(monthly, 0, 100));
+    }
+    return values.length > 0 ? Math.max(...values) : null;
+  }
+
+  function compactUsagePresentation(snapshot, nowMs = Date.now()) {
+    const waiting = { percent: null, text: '…', tone: 'waiting', status: 'waiting' };
+    const unavailable = {
+      percent: null,
+      text: '—',
+      tone: 'neutral',
+      status: 'unavailable',
+    };
+    if (!snapshot) {
+      return { status: 'waiting', rolling: waiting, monthly: waiting };
+    }
+    if (snapshot.status === 'not_applicable') {
+      const notApplicable = { ...unavailable, status: 'not_applicable' };
+      return {
+        status: 'not_applicable',
+        rolling: notApplicable,
+        monthly: notApplicable,
+      };
+    }
+    const metricPresentation = (metric, limited) => {
+      const rawPercent = finiteNumber(metric && metric.percent);
+      if (rawPercent === null) {
+        return limited
+          ? { ...unavailable, tone: 'danger', status: 'rate_limited' }
+          : unavailable;
+      }
+      const percent = clamp(rawPercent, 0, 100);
+      return {
+        percent,
+        text: formatPercent(percent),
+        tone: limited ? 'danger' : metricTone(percent),
+        status: limited ? 'rate_limited' : 'available',
+      };
+    };
+    const monthly =
+      snapshot.monthly && finiteNumber(snapshot.monthly.resetAt) > nowMs
+        ? snapshot.monthly
+        : null;
+    const rollingLimited =
+      snapshot.status === 'rate_limited' && snapshot.limitedBy !== 'billing_period';
+    const monthlyLimited =
+      snapshot.status === 'rate_limited' && snapshot.limitedBy === 'billing_period';
+    return {
+      status: snapshot.status === 'rate_limited' ? 'rate_limited' : 'available',
+      rolling: metricPresentation(snapshot.rolling, rollingLimited),
+      monthly: metricPresentation(monthly, monthlyLimited),
+    };
+  }
+
+  function renderCompactOrbMetric(ring, value, presentation) {
+    value.textContent = presentation.text;
+    ring.style.setProperty(
+      '--usage-orb-progress',
+      String(presentation.percent === null ? 0 : presentation.percent),
+    );
+    ring.dataset.tone = presentation.tone;
+  }
+
+  function renderCompactOrb(ui, snapshot, nowMs) {
+    const presentation = compactUsagePresentation(snapshot, nowMs);
+    renderCompactOrbMetric(
+      ui.orbRollingRing,
+      ui.orbRollingValue,
+      presentation.rolling,
+    );
+    renderCompactOrbMetric(
+      ui.orbMonthlyRing,
+      ui.orbMonthlyValue,
+      presentation.monthly,
+    );
+    const rollingText = presentation.rolling.text;
+    const monthlyText = presentation.monthly.text;
+    const label = presentation.status === 'not_applicable'
+      ? uiText(
+          'AI 用量：6 小时与月度均不适用，点击恢复',
+          'AI usage: 6h and Monthly are not applicable, click to restore',
+        )
+      : presentation.status === 'rate_limited'
+        ? uiText(
+            `AI 用量：6 小时 ${rollingText}，月度 ${monthlyText}，已达上限，点击恢复`,
+            `AI usage: 6h ${rollingText}, Monthly ${monthlyText}, limit reached, click to restore`,
+          )
+        : presentation.status === 'waiting'
+          ? uiText(
+              'AI 用量：6 小时与月度等待读取，点击恢复',
+              'AI usage: 6h and Monthly waiting, click to restore',
+            )
+          : uiText(
+              `AI 用量：6 小时 ${rollingText}，月度 ${monthlyText}，点击恢复`,
+              `AI usage: 6h ${rollingText}, Monthly ${monthlyText}, click to restore`,
+            );
+    ui.orb.setAttribute('aria-label', label);
   }
 
   function renderMetric(elements, metric, label, nowMs) {
@@ -1492,14 +2642,13 @@
       return;
     }
     const ui = runtime.ui;
-    const preserveAnchor = Boolean(
+    const preservedAnchor =
       ui &&
-        ui.position &&
+      ui.positionAnchor &&
         ui.summaryText === container &&
-        !ui.expanded &&
-        !ui.shell.hasAttribute('data-dragging'),
-    );
-    const summaryBefore = preserveAnchor ? ui.summary.getBoundingClientRect() : null;
+      !ui.dragActive
+        ? { ...ui.positionAnchor }
+        : null;
     const nodes = values.map((value) => {
       const part = container.ownerDocument.createElement('span');
       part.className = 'summary-part';
@@ -1509,18 +2658,7 @@
     });
     container.replaceChildren(...nodes);
     container.setAttribute('aria-label', values.map((value) => value.text).join('，'));
-    if (preserveAnchor && summaryBefore) {
-      const summaryAfter = ui.summary.getBoundingClientRect();
-      const side = ui.host.dataset.side === 'left' ? 'left' : 'right';
-      const horizontalShift =
-        side === 'right'
-          ? summaryBefore.right - summaryAfter.right
-          : summaryBefore.left - summaryAfter.left;
-      applyOverlayPosition(
-        { left: ui.position.left + horizontalShift, top: ui.position.top },
-        { persist: true, side },
-      );
-    }
+    if (preservedAnchor) applyOverlayAnchor(preservedAnchor);
   }
 
   function updateStaticUiCopy(ui, isLoading, isPreview) {
@@ -1542,7 +2680,13 @@
       isLoading ? uiText('正在读取', 'Loading') : uiText('刷新', 'Refresh'),
     );
     ui.refresh.title = isLoading ? uiText('正在读取…', 'Loading…') : uiText('刷新', 'Refresh');
-    ui.nativePage.textContent = uiText('原生用量页', 'Native Usage');
+    ui.minimize.setAttribute(
+      'aria-label',
+      uiText('最小化至输入框底部', 'Minimize to the composer bottom'),
+    );
+    ui.minimize.title = uiText('最小化至输入框底部', 'Minimize to the composer bottom');
+    ui.nativePage.setAttribute('aria-label', uiText('打开原生用量页', 'Open native Usage page'));
+    ui.nativePage.title = uiText('打开原生用量页', 'Open native Usage page');
   }
 
   function render() {
@@ -1557,6 +2701,7 @@
     const cooldownUntil = runtime.lastFetchedAt + MIN_REFRESH_INTERVAL;
     const isLoading = runtime.fetching || runtime.billingFetching;
     updateStaticUiCopy(ui, isLoading, snapshot && snapshot.enforcement === 'preview');
+    renderCompactOrb(ui, snapshot, nowMs);
     ui.refresh.disabled =
       isLoading ||
       (runtime.activeRefreshDisabled && runtime.billingRefreshDisabled) ||
@@ -1570,10 +2715,8 @@
           ? uiText('读取中', 'Loading')
           : uiText('等待', 'Waiting');
       setSummaryParts(ui.summaryText, [
-        { text: uiText('AI 用量', 'AI Usage') },
-        billingPart
-          ? { text: billingPart, separator: 'billing' }
-          : { text: waitingText, separator: 'usage' },
+        { text: waitingText },
+        billingPart ? { text: billingPart, separator: 'billing' } : null,
       ]);
       ui.dot.dataset.status = errorText ? 'error' : 'waiting';
       ui.notice.hidden = false;
@@ -1595,14 +2738,13 @@
             `${formatUpdated(billingStatus.updatedAt, nowMs)} — Notion same-origin API`,
           )
         : uiText('尚未取得有效数据', 'No valid data yet');
-      keepOverlayInViewport(true);
+      keepOverlayInViewport();
       return;
     }
 
     if (snapshot.status === 'not_applicable') {
       setSummaryParts(ui.summaryText, [
-        { text: uiText('AI 用量', 'AI Usage') },
-        { text: uiText('不适用', 'Not applicable'), separator: 'usage' },
+        { text: uiText('不适用', 'Not applicable') },
         billingPart ? { text: billingPart, separator: 'billing' } : null,
       ]);
       ui.dot.dataset.status = 'neutral';
@@ -1621,7 +2763,7 @@
       const activeMonthly =
         snapshot.monthly && snapshot.monthly.resetAt > nowMs ? snapshot.monthly : null;
       setSummaryParts(ui.summaryText, [
-        { text: `AI ${formatPercent(snapshot.rolling.percent)}` },
+        { text: formatPercent(snapshot.rolling.percent) },
         activeMonthly
           ? { text: formatPercent(activeMonthly.percent), separator: 'usage' }
           : null,
@@ -1664,7 +2806,7 @@
       `${formatUpdated(newestUpdate, nowMs)} — Notion 同源接口`,
       `${formatUpdated(newestUpdate, nowMs)} — Notion same-origin API`,
     );
-    keepOverlayInViewport(true);
+    keepOverlayInViewport();
   }
 
   function buildMetricRow(documentRef, key) {
@@ -1711,6 +2853,7 @@
     if (!root.document.body) return;
     const existingHost = root.document.getElementById(HOST_ID);
     if (existingHost && runtime.ui && existingHost === runtime.ui.host) return;
+    if (runtime.ui) stopDockTracking(runtime.ui);
     if (existingHost) existingHost.remove();
 
     const host = root.document.createElement('div');
@@ -1742,6 +2885,9 @@
           --usage-tooltip-text: #f7f7f5;
           --usage-tooltip-bg: #2f2f2f;
           --usage-tooltip-border: rgba(255,255,255,.12);
+          --usage-orb-track: rgba(255,255,255,.18);
+          --usage-orb-core: #202124;
+          --usage-orb-value: #f7f7f5;
           --usage-shadow: 0 14px 42px rgba(0,0,0,.36);
           --usage-summary-item-gap: 11px;
           --usage-summary-separator-space: 12px;
@@ -1781,6 +2927,9 @@
           --usage-tooltip-text: #252525;
           --usage-tooltip-bg: #fff;
           --usage-tooltip-border: rgba(15,15,15,.12);
+          --usage-orb-track: rgba(15,15,15,.16);
+          --usage-orb-core: #202124;
+          --usage-orb-value: #f7f7f5;
           --usage-shadow: 0 14px 38px rgba(15,15,15,.18);
         }
         * { box-sizing: border-box; }
@@ -1793,14 +2942,86 @@
         }
         :host([data-side="left"]) .shell { align-items: flex-start; }
         :host([data-vertical-side="up"]) .shell { flex-direction: column-reverse; }
+        :host([data-docked="composer"]) .shell { align-items: center; }
+        .orb {
+          pointer-events: auto;
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          max-width: 100%;
+          min-height: 28px;
+          padding: 2px;
+          border: 0;
+          border-radius: 999px;
+          color: var(--usage-text);
+          background: transparent;
+          cursor: pointer;
+          touch-action: manipulation;
+          user-select: none;
+          transition: transform .12s ease;
+        }
+        .orb:hover { transform: translateY(-1px); }
+        .orb[hidden], .summary[hidden] { display: none; }
+        .orb-metric {
+          display: block;
+          width: 24px;
+          height: 24px;
+          flex: 0 0 24px;
+          min-width: 24px;
+        }
+        .orb-ring {
+          --usage-orb-progress: 0;
+          --usage-orb-color: #35b46f;
+          display: block;
+          position: relative;
+          width: 24px;
+          height: 24px;
+          flex: 0 0 auto;
+          border-radius: 50%;
+          background: conic-gradient(
+            from -90deg,
+            var(--usage-orb-color) calc(var(--usage-orb-progress) * 1%),
+            var(--usage-orb-track) 0
+          );
+          box-shadow: 0 3px 10px rgba(0,0,0,.24);
+        }
+        .orb-ring::after {
+          content: "";
+          position: absolute;
+          inset: 3px;
+          border-radius: inherit;
+          background: var(--usage-orb-core);
+        }
+        .orb-ring[data-tone="warning"] { --usage-orb-color: #dfa83a; }
+        .orb-ring[data-tone="danger"] { --usage-orb-color: #ed6566; }
+        .orb-ring[data-tone="waiting"] { --usage-orb-color: #8c8c8c; }
+        .orb-ring[data-tone="neutral"] { --usage-orb-color: #8c8c8c; }
+        .orb-value {
+          position: absolute;
+          z-index: 1;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: var(--usage-orb-value);
+          font-size: 7px;
+          font-weight: 750;
+          font-variant-numeric: tabular-nums;
+          letter-spacing: -.05em;
+          opacity: 0;
+          white-space: nowrap;
+          transition: opacity .12s ease;
+        }
+        .orb:hover .orb-value,
+        .orb:focus-visible .orb-value { opacity: 1; }
         .summary {
           pointer-events: auto;
           display: inline-flex;
           align-items: center;
-          gap: var(--usage-summary-item-gap);
+          gap: 2px;
           min-height: 38px;
           max-width: 100%;
-          padding: 8px 13px;
+          padding: 0 6px 0 0;
           border: 1px solid var(--usage-border);
           border-radius: 999px;
           color: var(--usage-text);
@@ -1812,7 +3033,51 @@
           user-select: none;
         }
         .summary:hover { background: var(--usage-summary-hover); }
-        .summary:focus-visible, .action:focus-visible {
+        .summary-toggle {
+          display: inline-flex;
+          align-items: center;
+          gap: var(--usage-summary-item-gap);
+          min-width: 0;
+          min-height: 38px;
+          max-width: calc(100% - 28px);
+          padding: 8px 5px 8px 13px;
+          border: 0;
+          color: inherit;
+          background: transparent;
+          cursor: grab;
+          touch-action: none;
+          user-select: none;
+        }
+        .summary-minimize {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 24px;
+          height: 24px;
+          flex: 0 0 auto;
+          padding: 0;
+          border: 0;
+          border-radius: 50%;
+          color: var(--usage-muted);
+          background: transparent;
+          cursor: pointer;
+        }
+        .summary-minimize:hover {
+          color: var(--usage-text);
+          background: var(--usage-button-hover);
+        }
+        .summary-minimize svg {
+          width: 13px;
+          height: 13px;
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 2;
+          stroke-linecap: round;
+        }
+        .orb:focus-visible,
+        .summary-toggle:focus-visible,
+        .summary-minimize:focus-visible,
+        .action:focus-visible {
           outline: 2px solid #4e9cff;
           outline-offset: 2px;
         }
@@ -1838,7 +3103,6 @@
           letter-spacing: .01em;
         }
         .summary-part { flex: 0 0 auto; }
-        .summary-part:first-child { word-spacing: 2px; }
         .summary-part[data-separator="usage"]::before {
           content: "·";
           display: inline;
@@ -1858,7 +3122,9 @@
         .card {
           pointer-events: auto;
           width: min(336px, calc(100vw - 32px));
-          overflow: hidden;
+          max-height: max(0px, calc(100vh - 70px));
+          overflow: auto;
+          overscroll-behavior: contain;
           border: 1px solid var(--usage-border);
           border-radius: 14px;
           color: var(--usage-text);
@@ -1876,7 +3142,9 @@
           touch-action: none;
           user-select: none;
         }
+        .shell[data-dragging="true"] .orb,
         .shell[data-dragging="true"] .summary,
+        .shell[data-dragging="true"] .summary-toggle,
         .shell[data-dragging="true"] .header { cursor: grabbing; }
         .title-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
         .title { font-size: 14px; font-weight: 720; }
@@ -2022,26 +3290,40 @@
           color: var(--usage-faint);
           font-size: 10px;
         }
-        .footer-actions { display: flex; gap: 5px; }
+        .footer-actions { display: flex; flex: 0 0 auto; gap: 5px; }
         @media (max-width: 520px) {
           :host { top: 9px; right: 9px; max-width: calc(100vw - 18px); }
           .card { width: min(324px, calc(100vw - 18px)); }
         }
         @media (prefers-reduced-motion: reduce) {
           .bar-fill { transition: none; }
+          .orb { transition: none; }
+          .orb-value { transition: none; }
           .refresh.is-loading svg { animation: none; opacity: .55; }
           .preview-tooltip { transition: none; }
         }
       </style>
       <div class="shell">
-        <button class="summary" type="button" aria-expanded="false" aria-controls="notion-ai-usage-card">
-          <span class="dot" data-status="waiting" aria-hidden="true"></span>
-          <span class="summary-text">
-            <span class="summary-part">AI Usage</span>
-            <span class="summary-part">Waiting</span>
+        <button class="orb" type="button" aria-label="AI usage" hidden>
+          <span class="orb-metric" aria-hidden="true">
+            <span class="orb-ring orb-rolling-ring"><span class="orb-value orb-rolling-value">…</span></span>
           </span>
-          <span class="chevron" aria-hidden="true">▾</span>
+          <span class="orb-metric" aria-hidden="true">
+            <span class="orb-ring orb-monthly-ring"><span class="orb-value orb-monthly-value">…</span></span>
+          </span>
         </button>
+        <div class="summary">
+          <button class="summary-toggle" type="button" aria-expanded="false" aria-controls="notion-ai-usage-card">
+            <span class="dot" data-status="waiting" aria-hidden="true"></span>
+            <span class="summary-text">
+              <span class="summary-part">Waiting</span>
+            </span>
+            <span class="chevron" aria-hidden="true">▾</span>
+          </button>
+          <button class="summary-minimize" type="button" aria-label="Minimize to the composer bottom" title="Minimize to the composer bottom">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12"></path></svg>
+          </button>
+        </div>
         <section class="card" id="notion-ai-usage-card" aria-label="Notion AI Usage" hidden>
           <div class="header">
             <div class="title-group">
@@ -2071,7 +3353,13 @@
           <div class="footer">
             <span class="updated">Not updated yet</span>
             <span class="footer-actions">
-              <button class="action native-page" type="button">原生用量页</button>
+              <button class="action icon-action native-page" type="button" aria-label="Open native Usage page" title="Open native Usage page">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M14 4h6v6"></path>
+                  <path d="m20 4-9 9"></path>
+                  <path d="M20 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4"></path>
+                </svg>
+              </button>
             </span>
           </div>
         </section>
@@ -2088,7 +3376,13 @@
       host,
       shadow,
       shell: shadow.querySelector('.shell'),
+      orb: shadow.querySelector('.orb'),
+      orbRollingRing: shadow.querySelector('.orb-rolling-ring'),
+      orbRollingValue: shadow.querySelector('.orb-rolling-value'),
+      orbMonthlyRing: shadow.querySelector('.orb-monthly-ring'),
+      orbMonthlyValue: shadow.querySelector('.orb-monthly-value'),
       summary: shadow.querySelector('.summary'),
+      summaryToggle: shadow.querySelector('.summary-toggle'),
       summaryText: shadow.querySelector('.summary-text'),
       dot: shadow.querySelector('.dot'),
       chevron: shadow.querySelector('.chevron'),
@@ -2102,15 +3396,31 @@
       rolling,
       monthly,
       billing,
+      minimize: shadow.querySelector('.summary-minimize'),
       refresh: shadow.querySelector('.refresh'),
       nativePage: shadow.querySelector('.native-page'),
       updated: shadow.querySelector('.updated'),
       expanded: false,
+      minimized: false,
       position: null,
+      positionAnchor: null,
+      dragActive: false,
       suppressSummaryClick: false,
+      dockComposer: null,
+      dockEditor: null,
+      dockResizeObserver: null,
+      dockMutationObserver: null,
+      dockMutationTarget: null,
     };
 
-    runtime.ui.summary.addEventListener('click', () => {
+    runtime.ui.summary.addEventListener('click', (event) => {
+      if (
+        event.target &&
+        typeof event.target.closest === 'function' &&
+        event.target.closest('.summary-minimize')
+      ) {
+        return;
+      }
       const transition = summaryClickTransition(
         runtime.ui.expanded,
         runtime.ui.suppressSummaryClick,
@@ -2118,9 +3428,36 @@
       runtime.ui.suppressSummaryClick = transition.suppressNextClick;
       if (transition.expanded !== runtime.ui.expanded) setExpanded(transition.expanded);
     });
-    runtime.ui.summary.addEventListener('keydown', (event) => {
+    runtime.ui.summaryToggle.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' || event.key === ' ') {
         runtime.ui.suppressSummaryClick = false;
+      }
+    });
+    runtime.ui.orb.addEventListener('click', () => {
+      if (runtime.ui.suppressSummaryClick) {
+        runtime.ui.suppressSummaryClick = false;
+        return;
+      }
+      const ui = runtime.ui;
+      setMinimized(false);
+      try {
+        ui.summaryToggle.focus({ preventScroll: true });
+      } catch {
+        ui.summaryToggle.focus();
+      }
+    });
+    runtime.ui.orb.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        runtime.ui.suppressSummaryClick = false;
+      }
+    });
+    runtime.ui.minimize.addEventListener('click', () => {
+      const ui = runtime.ui;
+      setMinimized(true);
+      try {
+        ui.orb.focus({ preventScroll: true });
+      } catch {
+        ui.orb.focus();
       }
     });
     runtime.ui.refresh.addEventListener('click', () => {
@@ -2132,18 +3469,21 @@
       target.searchParams.set('target', 'aiusage');
       root.location.assign(target.href);
     });
-    installDragHandle(runtime.ui.summary, { suppressClick: true });
-    installDragHandle(runtime.ui.header, { ignoreInteractive: true });
+    installOverlayDragging(runtime.ui);
 
     root.document.body.appendChild(host);
     let expanded = false;
+    let minimized = false;
     try {
       expanded = root.localStorage.getItem(EXPANDED_KEY) === '1';
+      minimized = root.localStorage.getItem(MINIMIZED_KEY) === '1';
     } catch {
       expanded = false;
+      minimized = false;
     }
     setExpanded(expanded);
     restoreOverlayPosition();
+    setMinimized(minimized, false);
     render();
   }
 
@@ -2154,6 +3494,18 @@
     }
     if (root.document.body && runtime.ui.host.parentNode !== root.document.body) {
       root.document.body.appendChild(runtime.ui.host);
+    }
+    if (runtime.ui.minimized) {
+      startDockTracking(runtime.ui);
+      scheduleMinimizedDock();
+    }
+    if (
+      runtime.positionLoadStatus === 'failed' &&
+      !runtime.ui.dragActive &&
+      Date.now() >= runtime.positionRetryAt
+    ) {
+      restoreOverlayPosition(true);
+      render();
     }
   }
 
@@ -2910,7 +4262,14 @@
   root.document.addEventListener('visibilitychange', () => {
     if (!root.document.hidden) runHeartbeat();
   });
-  root.addEventListener('resize', () => keepOverlayInViewport(true), { passive: true });
+  root.addEventListener('resize', keepOverlayInViewport, { passive: true });
+  root.addEventListener('scroll', scheduleMinimizedDock, { capture: true, passive: true });
+  root.addEventListener('focusin', scheduleMinimizedDock, { capture: true, passive: true });
+  if (root.visualViewport) {
+    root.visualViewport.addEventListener('resize', scheduleMinimizedDock, { passive: true });
+    root.visualViewport.addEventListener('scroll', scheduleMinimizedDock, { passive: true });
+  }
+  root.addEventListener('storage', handleOverlayPositionStorage);
   root.setInterval(runHeartbeat, 30000);
   root.setInterval(ensureUi, 2500);
 })(
