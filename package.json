@@ -1,9 +1,9 @@
 {
   "name": "notion-ai-usage",
-  "version": "1.0.0",
-  "releaseLabel": "[20260730] v1.0.0",
+  "version": "1.1.0",
+  "releaseLabel": "[20260730] v1.1.0",
   "private": true,
-  "description": "A dependency-free userscript that shows Notion AI usage and Business Trial time.",
+  "description": "A dependency-free userscript that shows Notion AI usage and workspace plan status.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/0-V-linuxdo/notion-ai-usage.git"

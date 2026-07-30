@@ -13,14 +13,20 @@ const {
   CURRENT_ENDPOINT,
   LEGACY_ENDPOINT,
   activeFailureCanCommit,
+  activeBillingStatus,
   activeBusinessTrial,
+  billingFailureMessage,
+  billingSummaryPart,
   billingFailureCanCommit,
   businessTrialDaysRemaining,
   businessTrialEndsToday,
+  clampOverlayPosition,
   cssColorTheme,
   contextTokenMatches,
   currentUiLanguage,
   currentUiTheme,
+  dragPosition,
+  dragThresholdReached,
   endpointKind,
   extractSpaceId,
   fetchMetadata,
@@ -28,15 +34,21 @@ const {
   formatPercent,
   formatReset,
   isNotionPageUrl,
+  normalizeBillingStatus,
   normalizeBusinessTrial,
   normalizeVerdict,
   percentage,
+  parseOverlayPosition,
+  planDisplayName,
   pollingInterval,
+  preferredVerticalSide,
   mergeRecipeHeaders,
   requestBodyText,
   responseSequenceIsFresh,
   safeHeaders,
   shouldBootstrapInFrame,
+  subscriptionStatusText,
+  summaryClickTransition,
   uiText,
   usageRefreshPlan,
 } = require('../notion-ai-usage.user.js');
@@ -48,9 +60,9 @@ const PACKAGE_PATH = path.resolve(__dirname, '../package.json');
 
 test('uses AdGuard-compatible metadata and unsafeWindow realm constructors', () => {
   const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
-  assert.match(source, /^\/\/ @name\s+\[Notion AI\] Usage \[20260730\] v1\.0\.0$/m);
+  assert.match(source, /^\/\/ @name\s+\[Notion AI\] Usage \[20260730\] v1\.1\.0$/m);
   assert.match(source, /^\/\/ @namespace\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage$/m);
-  assert.match(source, /^\/\/ @version\s+20260730\.1\.0\.0$/m);
+  assert.match(source, /^\/\/ @version\s+20260730\.1\.1\.0$/m);
   assert.match(source, /^\/\/ @homepageURL\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage$/m);
   assert.match(source, /^\/\/ @supportURL\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage\/issues$/m);
   assert.match(source, /^\/\/ @downloadURL\s+https:\/\/raw\.githubusercontent\.com\/0-V-linuxdo\/notion-ai-usage\/main\/notion-ai-usage\.user\.js$/m);
@@ -98,8 +110,8 @@ test('uses AdGuard-compatible metadata and unsafeWindow realm constructors', () 
 test('keeps package and display release metadata aligned', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'));
   assert.equal(packageJson.name, 'notion-ai-usage');
-  assert.equal(packageJson.version, '1.0.0');
-  assert.equal(packageJson.releaseLabel, '[20260730] v1.0.0');
+  assert.equal(packageJson.version, '1.1.0');
+  assert.equal(packageJson.releaseLabel, '[20260730] v1.1.0');
   assert.equal(
     packageJson.repository.url,
     'git+https://github.com/0-V-linuxdo/notion-ai-usage.git',
@@ -174,6 +186,121 @@ test('matches preview tooltip colors to Notion light and dark themes', () => {
   assert.match(tooltipRule, /border:\s*1px solid var\(--usage-tooltip-border\);/);
   assert.match(tooltipRule, /color:\s*var\(--usage-tooltip-text\);/);
   assert.match(tooltipRule, /background:\s*var\(--usage-tooltip-bg\);/);
+});
+
+test('clamps dragged overlay coordinates to the visible viewport', () => {
+  assert.deepEqual(
+    clampOverlayPosition(
+      { left: 900, top: 700 },
+      { width: 1000, height: 800 },
+      { width: 336, height: 200 },
+    ),
+    { left: 656, top: 592 },
+  );
+  assert.deepEqual(
+    clampOverlayPosition(
+      { left: -50, top: -20 },
+      { width: 1000, height: 800 },
+      { width: 336, height: 200 },
+    ),
+    { left: 8, top: 8 },
+  );
+  assert.deepEqual(
+    clampOverlayPosition(
+      { left: 40, top: 30 },
+      { width: 200, height: 100 },
+      { width: 300, height: 120 },
+    ),
+    { left: 8, top: 8 },
+  );
+  assert.equal(
+    preferredVerticalSide(
+      { top: 20, bottom: 58 },
+      300,
+      { width: 1000, height: 800 },
+    ),
+    'down',
+  );
+  assert.equal(
+    preferredVerticalSide(
+      { top: 650, bottom: 688 },
+      300,
+      { width: 1000, height: 800 },
+    ),
+    'up',
+  );
+});
+
+test('calculates drag movement and latches only after the movement threshold', () => {
+  assert.deepEqual(
+    dragPosition(
+      { left: 100, top: 80 },
+      { x: 10, y: 20 },
+      { x: 50, y: 70 },
+      { width: 500, height: 400 },
+      { width: 100, height: 90 },
+    ),
+    { left: 140, top: 130 },
+  );
+  assert.equal(dragThresholdReached(false, { x: 0, y: 0 }, { x: 2, y: 3 }), false);
+  assert.equal(dragThresholdReached(false, { x: 0, y: 0 }, { x: 4, y: 0 }), true);
+  assert.equal(dragThresholdReached(true, null, null), true);
+});
+
+test('accepts only finite versioned overlay positions and consumes one drag click', () => {
+  assert.deepEqual(
+    parseOverlayPosition('{"v":1,"left":100.5,"top":80}'),
+    { left: 100.5, top: 80 },
+  );
+  assert.deepEqual(
+    parseOverlayPosition(
+      '{"v":1,"left":100,"top":80,"side":"left","verticalSide":"up"}',
+    ),
+    { left: 100, top: 80, side: 'left', verticalSide: 'up' },
+  );
+  assert.equal(parseOverlayPosition('{"v":2,"left":100,"top":80}'), null);
+  assert.equal(parseOverlayPosition('{"v":1,"left":"100","top":80}'), null);
+  assert.equal(parseOverlayPosition('{"v":1,"left":null,"top":80}'), null);
+  assert.equal(parseOverlayPosition('[1,2]'), null);
+  assert.equal(parseOverlayPosition('not json'), null);
+
+  assert.deepEqual(summaryClickTransition(false, false), {
+    expanded: true,
+    suppressNextClick: false,
+  });
+  assert.deepEqual(summaryClickTransition(true, true), {
+    expanded: true,
+    suppressNextClick: false,
+  });
+});
+
+test('wires pointer dragging, persistence, and roomier capsule spacing', () => {
+  const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
+  assert.match(source, /const POSITION_KEY = 'notion-ai-usage:position:v1';/);
+  assert.match(source, /handle\.addEventListener\('pointerdown'/);
+  assert.match(source, /handle\.addEventListener\('pointermove'/);
+  assert.match(source, /handle\.addEventListener\('pointerup'/);
+  assert.match(source, /handle\.addEventListener\('pointercancel'/);
+  assert.match(source, /handle\.setPointerCapture\(event\.pointerId\)/);
+  assert.match(source, /installDragHandle\(runtime\.ui\.summary, \{ suppressClick: true \}\)/);
+  assert.match(source, /installDragHandle\(runtime\.ui\.header, \{ ignoreInteractive: true \}\)/);
+  assert.match(source, /root\.addEventListener\('resize', \(\) => keepOverlayInViewport\(true\)/);
+
+  const summaryRule = source.match(/\.summary \{([\s\S]*?)\n        \}/)?.[1] || '';
+  const headerRule = source.match(/\.header \{([\s\S]*?)\n        \}/)?.[1] || '';
+  assert.match(summaryRule, /gap:\s*var\(--usage-summary-item-gap\);/);
+  assert.match(summaryRule, /min-height:\s*38px;/);
+  assert.match(summaryRule, /padding:\s*8px 13px;/);
+  assert.match(summaryRule, /touch-action:\s*none;/);
+  assert.match(summaryRule, /user-select:\s*none;/);
+  assert.match(headerRule, /cursor:\s*grab;/);
+  assert.match(headerRule, /touch-action:\s*none;/);
+  assert.match(source, /\.summary-part:first-child \{ word-spacing: 2px; \}/);
+  assert.match(source, /\.summary-part\[data-separator="usage"\]::before/);
+  assert.match(source, /\.summary-part\[data-separator="billing"\]::before/);
+  assert.doesNotMatch(source, /\.summary-part:nth-child/);
+  assert.match(source, /margin: 0 var\(--usage-summary-separator-space\);/);
+  assert.match(source, /:host\(\[data-vertical-side="up"\]\) \.shell/);
 });
 
 test('calculates clamped usage percentages', () => {
@@ -314,6 +441,230 @@ test('matches only exact same-origin Notion endpoints', () => {
   assert.equal(endpointKind(`https://evil.example${BILLING_ENDPOINT}`), null);
 });
 
+test('normalizes an active Business subscription without retaining billing details', () => {
+  const currentPeriodEndAt = NOW + 335 * 86400000;
+  const billingStatus = normalizeBillingStatus(
+    {
+      billingData: {
+        provider: 'stripe',
+        address: { line1: 'must not be retained' },
+        payment: { card: 'must not be retained' },
+        paymentMethod: { last4: '0000' },
+        subscription: {
+          provider: 'stripe',
+          status: 'active',
+          startDate: new Date(NOW - 30 * 86400000).toISOString(),
+          currentPeriodEnd: new Date(currentPeriodEndAt).toISOString(),
+          items: [
+            { price: { product: 'ai' } },
+            {
+              quantity: 1,
+              price: { product: 'business', billingInterval: 'year' },
+            },
+          ],
+        },
+      },
+      dependencies: [{ ignored: true }],
+    },
+    NOW,
+  );
+
+  assert.deepEqual(billingStatus, {
+    kind: 'subscription',
+    status: 'active',
+    plan: 'business',
+    currentPeriodEndAt,
+    updatedAt: NOW,
+  });
+  for (const key of ['provider', 'address', 'payment', 'paymentMethod', 'dependencies']) {
+    assert.equal(Object.hasOwn(billingStatus, key), false);
+  }
+});
+
+test('maps an unknown subscription status to unknown', () => {
+  const billingStatus = normalizeBillingStatus(
+    {
+      billingData: {
+        subscription: {
+          status: 'new_provider_state',
+          items: [{ price: { product: 'business', billingInterval: 'month' } }],
+        },
+      },
+    },
+    NOW,
+  );
+
+  assert.equal(billingStatus.kind, 'subscription');
+  assert.equal(billingStatus.status, 'unknown');
+  assert.equal(billingStatus.plan, 'business');
+});
+
+test('keeps a subscription visible when its plan product is unknown', () => {
+  const billingStatus = normalizeBillingStatus(
+    {
+      billingData: {
+        subscription: {
+          status: 'active',
+          items: [{ price: { product: 'business_v2', billingInterval: 'month' } }],
+        },
+      },
+    },
+    NOW,
+  );
+
+  assert.equal(billingStatus.kind, 'subscription');
+  assert.equal(billingStatus.status, 'active');
+  assert.equal(billingStatus.plan, 'unknown');
+
+  const mixedWithFree = normalizeBillingStatus(
+    {
+      billingData: {
+        subscription: {
+          status: 'active',
+          items: [
+            { price: { product: 'free' } },
+            { price: { product: 'business_v2' } },
+          ],
+        },
+      },
+    },
+    NOW,
+  );
+  assert.equal(mixedWithFree.kind, 'subscription');
+  assert.equal(mixedWithFree.plan, 'unknown');
+});
+
+test('rejects an active trial whose plan product cannot be identified', () => {
+  const trial = {
+    startDate: new Date(NOW - 86400000).toISOString(),
+    endDate: new Date(NOW + 86400000).toISOString(),
+  };
+
+  assert.equal(
+    normalizeBillingStatus({ billingData: { trial: { ...trial, items: [] } } }, NOW),
+    null,
+  );
+  assert.equal(
+    normalizeBillingStatus(
+      {
+        billingData: {
+          trial: { ...trial, items: [{ price: { product: 'business_v2' } }] },
+        },
+      },
+      NOW,
+    ),
+    null,
+  );
+});
+
+test('uses only separate trial items when an Enterprise subscription is present', () => {
+  const trialEndAt = NOW + 10 * 86400000;
+  const billingStatus = normalizeBillingStatus(
+    {
+      billingData: {
+        trial: {
+          startDate: new Date(NOW - 2 * 86400000).toISOString(),
+          endDate: new Date(trialEndAt).toISOString(),
+          items: [{ price: { product: 'business' } }],
+        },
+        subscription: {
+          status: 'active',
+          items: [{ price: { product: 'enterprise', billingInterval: 'year' } }],
+        },
+      },
+    },
+    NOW,
+  );
+
+  assert.equal(billingStatus.kind, 'trial');
+  assert.equal(billingStatus.status, 'active');
+  assert.equal(billingStatus.plan, 'business');
+  assert.equal(billingStatus.endAt, trialEndAt);
+  assert.equal(activeBillingStatus(billingStatus, NOW), billingStatus);
+});
+
+test('falls back from an expired subscription-backed trial to the subscription', () => {
+  const currentPeriodEndAt = NOW + 20 * 86400000;
+  const billingStatus = normalizeBillingStatus(
+    {
+      billingData: {
+        subscription: {
+          status: 'active',
+          startDate: new Date(NOW - 30 * 86400000).toISOString(),
+          trialEnd: new Date(NOW - 1).toISOString(),
+          currentPeriodEnd: new Date(currentPeriodEndAt).toISOString(),
+          items: [{ price: { product: 'business', billingInterval: 'month' } }],
+        },
+      },
+    },
+    NOW,
+  );
+
+  assert.equal(billingStatus.kind, 'subscription');
+  assert.equal(billingStatus.status, 'active');
+  assert.equal(billingStatus.plan, 'business');
+  assert.equal(billingStatus.currentPeriodEndAt, currentPeriodEndAt);
+  assert.equal(activeBillingStatus(billingStatus, NOW), billingStatus);
+});
+
+test('normalizes a missing subscription as the Free plan', () => {
+  const billingStatus = normalizeBillingStatus({ billingData: {} }, NOW);
+
+  assert.deepEqual(billingStatus, {
+    kind: 'none',
+    status: 'none',
+    plan: 'free',
+    updatedAt: NOW,
+  });
+  assert.equal(activeBillingStatus(billingStatus, NOW), billingStatus);
+});
+
+test('preserves enterprise_limited internally and keeps it active', () => {
+  const billingStatus = normalizeBillingStatus(
+    {
+      billingData: {
+        subscription: {
+          status: 'active',
+          items: [
+            { price: { product: 'business', billingInterval: 'month' } },
+            { price: { product: 'enterprise_limited', billingInterval: 'year' } },
+          ],
+        },
+      },
+    },
+    NOW,
+  );
+
+  assert.equal(billingStatus.kind, 'subscription');
+  assert.equal(billingStatus.plan, 'enterprise_limited');
+  assert.equal(activeBillingStatus(billingStatus, NOW), billingStatus);
+});
+
+test('formats subscription status for the capsule and expanded plan row', () => {
+  const billingStatus = {
+    kind: 'subscription',
+    status: 'active',
+    plan: 'business',
+    updatedAt: NOW,
+  };
+
+  assert.equal(billingSummaryPart(billingStatus, NOW), 'Business · Active');
+  assert.equal(planDisplayName('enterprise_limited'), 'Enterprise');
+  assert.equal(planDisplayName('unknown'), 'Unknown');
+  assert.equal(subscriptionStatusText('unknown'), 'Status unavailable');
+});
+
+test('formats visible billing permission and timeout failures', () => {
+  assert.equal(
+    billingFailureMessage({ status: 403 }, 'en'),
+    'Subscription status unavailable: this account cannot access billing data',
+  );
+  assert.equal(
+    billingFailureMessage({ name: 'AbortError' }, 'zh'),
+    '读取订阅状态超时',
+  );
+});
+
 test('normalizes a separate Business Trial using Notion billing clock semantics', () => {
   const trial = normalizeBusinessTrial(
     {
@@ -409,6 +760,26 @@ test('matches Notion by converting billing ISO timestamps to the browser timezon
   );
   assert.equal(businessTrialDaysRemaining(endingToday, NOW), 1);
   assert.equal(businessTrialEndsToday(endingToday, NOW), true);
+});
+
+test('advances a captured billing clock until the trial expires', () => {
+  const serverNow = new Date(NOW).toISOString();
+  const trial = normalizeBusinessTrial(
+    {
+      billingData: {
+        clock: { externalId: 'test-clock', now: serverNow },
+        trial: {
+          startDate: new Date(NOW - 86400000).toISOString(),
+          endDate: new Date(NOW + 60000).toISOString(),
+          items: [{ price: { product: 'business' } }],
+        },
+      },
+    },
+    NOW,
+  );
+
+  assert.equal(activeBusinessTrial(trial, NOW + 59999), trial);
+  assert.equal(activeBusinessTrial(trial, NOW + 60000), null);
 });
 
 test('hides expired, non-Business, and absent trials', () => {

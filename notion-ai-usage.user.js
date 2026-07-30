@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         [Notion AI] Usage [20260730] v1.0.0
+// @name         [Notion AI] Usage [20260730] v1.1.0
 // @namespace    https://github.com/0-V-linuxdo/notion-ai-usage
-// @version      20260730.1.0.0
-// @description  Show Notion AI usage and Business Trial time without exposing cookies or tokens.
+// @version      20260730.1.1.0
+// @description  Show Notion AI usage and workspace plan status without exposing cookies or tokens.
 // @homepageURL  https://github.com/0-V-linuxdo/notion-ai-usage
 // @supportURL   https://github.com/0-V-linuxdo/notion-ai-usage/issues
 // @downloadURL  https://raw.githubusercontent.com/0-V-linuxdo/notion-ai-usage/main/notion-ai-usage.user.js
@@ -24,6 +24,9 @@
   const SCRIPT_PREFIX = '[Notion AI Usage]';
   const HOST_ID = 'notion-ai-usage-userscript-host';
   const EXPANDED_KEY = 'notion-ai-usage:expanded:v1';
+  const POSITION_KEY = 'notion-ai-usage:position:v1';
+  const POSITION_INSET = 8;
+  const DRAG_THRESHOLD = 4;
   const MIN_REFRESH_INTERVAL = 15000;
   const BILLING_REFRESH_INTERVAL = 60 * 60 * 1000;
   const CURRENT_RESPONSE_GRACE_INTERVAL = 1000;
@@ -36,6 +39,16 @@
   ]);
   const NOTION_HOSTNAMES = new Set(['app.notion.com', 'www.notion.so', 'notion.so']);
   const VALID_STATUSES = new Set(['within_limit', 'rate_limited', 'not_applicable']);
+  const VALID_SUBSCRIPTION_STATUSES = new Set([
+    'active',
+    'trialing',
+    'past_due',
+    'unpaid',
+    'paused',
+    'canceled',
+    'incomplete',
+    'incomplete_expired',
+  ]);
   const SPACE_ID_PATTERN = /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
   const PLAN_RANK = new Map([
     ['free', 0],
@@ -44,6 +57,7 @@
     ['plus', 3],
     ['business', 4],
     ['enterprise', 5],
+    ['enterprise_limited', 5],
   ]);
 
   function isRecord(value) {
@@ -334,10 +348,17 @@
         selectedRank = rank;
       }
     }
-    return selected || 'free';
+    return selected;
   }
 
-  function normalizeBusinessTrial(payload, nowMs = Date.now()) {
+  function hasUnknownBillingProduct(items) {
+    return items.some((item) => {
+      const product = isRecord(item) && isRecord(item.price) ? item.price.product : null;
+      return typeof product === 'string' && !PLAN_RANK.has(product);
+    });
+  }
+
+  function normalizeBillingStatus(payload, nowMs = Date.now()) {
     const billingData = billingDataFromPayload(payload);
     if (!billingData) return null;
 
@@ -350,51 +371,96 @@
 
     // Notion treats these two representations as mutually exclusive.
     if (hasSubscriptionTrial && hasSeparateTrial) return null;
-    if (!hasSubscriptionTrial && !hasSeparateTrial) {
-      return { status: 'none', updatedAt: nowMs };
-    }
-
-    const endRaw = hasSubscriptionTrial ? subscriptionEndRaw : separateEndRaw;
-    const startRaw = hasSubscriptionTrial
-      ? subscription && subscription.startDate
-      : separateTrial && separateTrial.startDate;
-    const endAt = parseIsoTimestamp(endRaw);
-    const startAt = parseIsoTimestamp(startRaw);
-    if (endAt === null) return null;
-    if (typeof startRaw === 'string' && (startAt === null || startAt > endAt)) return null;
-
     const clock = isRecord(billingData.clock) ? billingData.clock : null;
     const serverClockRaw = clock && clock.externalId ? clock.now : null;
     const serverClockAt = parseIsoTimestamp(serverClockRaw);
     const usesServerClock = serverClockAt !== null;
     const referenceNowAt = usesServerClock ? serverClockAt : nowMs;
-    if (endAt - referenceNowAt > 2 * 366 * 86400000) return null;
 
-    const activeItems = hasSubscriptionTrial
-      ? itemList(subscription && subscription.items)
-      : [
-          ...itemList(separateTrial && separateTrial.items),
-          ...itemList(subscription && subscription.items),
-        ].slice(0, 80);
-    const plan = highestPlanProduct(activeItems);
+    if (hasSubscriptionTrial || hasSeparateTrial) {
+      const endRaw = hasSubscriptionTrial ? subscriptionEndRaw : separateEndRaw;
+      const startRaw = hasSubscriptionTrial
+        ? subscription && subscription.startDate
+        : separateTrial && separateTrial.startDate;
+      const endAt = parseIsoTimestamp(endRaw);
+      const startAt = parseIsoTimestamp(startRaw);
+      if (endAt === null) return null;
+      if (typeof startRaw === 'string' && (startAt === null || startAt > endAt)) return null;
+      if (endAt - referenceNowAt > 2 * 366 * 86400000) return null;
 
-    if (endAt <= referenceNowAt || plan !== 'business') {
-      return { status: 'none', updatedAt: nowMs };
+      const activeItems = hasSubscriptionTrial
+        ? itemList(subscription && subscription.items)
+        : itemList(separateTrial && separateTrial.items);
+      const plan = highestPlanProduct(activeItems);
+
+      if (endAt > referenceNowAt && plan === 'business') {
+        return {
+          kind: 'trial',
+          status: 'active',
+          plan,
+          startAt,
+          endAt,
+          autoConvert:
+            separateTrial && typeof separateTrial.autoConvert === 'boolean'
+              ? separateTrial.autoConvert
+              : null,
+          usesServerClock,
+          referenceNowAt,
+          updatedAt: nowMs,
+        };
+      }
+      if (
+        endAt > referenceNowAt &&
+        (plan === null || hasUnknownBillingProduct(activeItems))
+      ) {
+        return null;
+      }
     }
 
+    if (!subscription) {
+      return { kind: 'none', status: 'none', plan: 'free', updatedAt: nowMs };
+    }
+
+    const subscriptionItems = itemList(subscription.items);
+    const recognizedPlan = highestPlanProduct(subscriptionItems);
+    const hasUnknownProduct = hasUnknownBillingProduct(subscriptionItems);
+    if (recognizedPlan === 'free' && !hasUnknownProduct) {
+      return { kind: 'none', status: 'none', plan: 'free', updatedAt: nowMs };
+    }
+    const plan = recognizedPlan && recognizedPlan !== 'free' ? recognizedPlan : 'unknown';
+
+    const planItem = subscriptionItems.find(
+      (item) =>
+        isRecord(item) &&
+        isRecord(item.price) &&
+        (recognizedPlan ? item.price.product === recognizedPlan : true),
+    );
+    const currentPeriodEndRaw =
+      typeof subscription.currentPeriodEnd === 'string'
+        ? subscription.currentPeriodEnd
+        : planItem && typeof planItem.currentPeriodEnd === 'string'
+          ? planItem.currentPeriodEnd
+          : null;
+    const currentPeriodEndAt = parseIsoTimestamp(currentPeriodEndRaw);
+    const rawStatus =
+      typeof subscription.status === 'string' &&
+      VALID_SUBSCRIPTION_STATUSES.has(subscription.status)
+        ? subscription.status
+        : 'unknown';
+
     return {
-      status: 'active',
+      kind: 'subscription',
+      status: rawStatus,
       plan,
-      startAt,
-      endAt,
-      autoConvert:
-        separateTrial && typeof separateTrial.autoConvert === 'boolean'
-          ? separateTrial.autoConvert
-          : null,
-      usesServerClock,
-      referenceNowAt,
+      currentPeriodEndAt,
       updatedAt: nowMs,
     };
+  }
+
+  function normalizeBusinessTrial(payload, nowMs = Date.now()) {
+    const normalized = normalizeBillingStatus(payload, nowMs);
+    if (!normalized || normalized.kind === 'trial') return normalized;
+    return { kind: 'none', status: 'none', plan: 'free', updatedAt: nowMs };
   }
 
   function localStartOfDay(timestamp) {
@@ -406,7 +472,9 @@
 
   function businessTrialReferenceNow(trial, nowMs = Date.now()) {
     if (!trial || trial.status !== 'active') return null;
-    return trial.usesServerClock ? trial.referenceNowAt : nowMs;
+    if (!trial.usesServerClock) return nowMs;
+    if (!Number.isFinite(trial.referenceNowAt) || !Number.isFinite(trial.updatedAt)) return null;
+    return trial.referenceNowAt + Math.max(0, nowMs - trial.updatedAt);
   }
 
   function businessTrialDaysRemaining(trial, nowMs = Date.now()) {
@@ -418,8 +486,17 @@
   }
 
   function activeBusinessTrial(trial, nowMs = Date.now()) {
+    if (!trial || trial.kind !== 'trial') return null;
     const referenceNow = businessTrialReferenceNow(trial, nowMs);
     return referenceNow !== null && trial.endAt > referenceNow ? trial : null;
+  }
+
+  function activeBillingStatus(billingStatus, nowMs = Date.now()) {
+    if (!billingStatus) return null;
+    if (billingStatus.kind === 'trial') return activeBusinessTrial(billingStatus, nowMs);
+    return billingStatus.kind === 'subscription' || billingStatus.kind === 'none'
+      ? billingStatus
+      : null;
   }
 
   function businessTrialEndsToday(trial, nowMs = Date.now()) {
@@ -590,6 +667,36 @@
     return language === 'zh' ? chinese : english;
   }
 
+  function billingFailureMessage(error, language = currentUiLanguage()) {
+    const status = finiteNumber(error && error.status);
+    if (status === 401 || status === 403) {
+      return uiText(
+        '无法读取订阅状态：当前账户没有账单数据权限',
+        'Subscription status unavailable: this account cannot access billing data',
+        language,
+      );
+    }
+    if (status === 429) {
+      return uiText(
+        '订阅状态请求过于频繁，稍后自动重试',
+        'Subscription status request was rate limited; retrying later',
+        language,
+      );
+    }
+    if (error && error.name === 'AbortError') {
+      return uiText(
+        '读取订阅状态超时',
+        'Subscription status request timed out',
+        language,
+      );
+    }
+    return uiText(
+      '暂时无法读取订阅状态',
+      'Unable to load subscription status',
+      language,
+    );
+  }
+
   function cssColorTheme(value) {
     if (typeof value !== 'string') return null;
     const match = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+))?\s*\)$/i.exec(
@@ -737,12 +844,99 @@
     return 60000;
   }
 
+  function parseOverlayPosition(raw) {
+    if (typeof raw !== 'string' || raw.length === 0) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!isRecord(parsed) || parsed.v !== 1) return null;
+      if (
+        typeof parsed.left !== 'number' ||
+        !Number.isFinite(parsed.left) ||
+        typeof parsed.top !== 'number' ||
+        !Number.isFinite(parsed.top)
+      ) {
+        return null;
+      }
+      const position = { left: parsed.left, top: parsed.top };
+      if (parsed.side === 'left' || parsed.side === 'right') position.side = parsed.side;
+      if (parsed.verticalSide === 'up' || parsed.verticalSide === 'down') {
+        position.verticalSide = parsed.verticalSide;
+      }
+      return position;
+    } catch {
+      return null;
+    }
+  }
+
+  function clampOverlayPosition(position, viewport, overlay, inset = POSITION_INSET) {
+    const parsedInset = nonNegativeNumber(inset);
+    const safeInset = parsedInset === null ? POSITION_INSET : parsedInset;
+    const viewportWidth = Math.max(0, finiteNumber(viewport && viewport.width) || 0);
+    const viewportHeight = Math.max(0, finiteNumber(viewport && viewport.height) || 0);
+    const overlayWidth = Math.max(0, finiteNumber(overlay && overlay.width) || 0);
+    const overlayHeight = Math.max(0, finiteNumber(overlay && overlay.height) || 0);
+    const maximumLeft = Math.max(safeInset, viewportWidth - overlayWidth - safeInset);
+    const maximumTop = Math.max(safeInset, viewportHeight - overlayHeight - safeInset);
+    const requestedLeft = finiteNumber(position && position.left);
+    const requestedTop = finiteNumber(position && position.top);
+    return {
+      left: clamp(requestedLeft === null ? safeInset : requestedLeft, safeInset, maximumLeft),
+      top: clamp(requestedTop === null ? safeInset : requestedTop, safeInset, maximumTop),
+    };
+  }
+
+  function dragThresholdReached(previouslyDragged, start, current, threshold = DRAG_THRESHOLD) {
+    if (previouslyDragged) return true;
+    const startX = finiteNumber(start && start.x);
+    const startY = finiteNumber(start && start.y);
+    const currentX = finiteNumber(current && current.x);
+    const currentY = finiteNumber(current && current.y);
+    const parsedThreshold = nonNegativeNumber(threshold);
+    if (startX === null || startY === null || currentX === null || currentY === null) return false;
+    const safeThreshold = parsedThreshold === null ? DRAG_THRESHOLD : parsedThreshold;
+    const deltaX = currentX - startX;
+    const deltaY = currentY - startY;
+    return deltaX * deltaX + deltaY * deltaY >= safeThreshold * safeThreshold;
+  }
+
+  function dragPosition(origin, start, current, viewport, overlay, inset = POSITION_INSET) {
+    const originLeft = finiteNumber(origin && origin.left);
+    const originTop = finiteNumber(origin && origin.top);
+    const startX = finiteNumber(start && start.x);
+    const startY = finiteNumber(start && start.y);
+    const currentX = finiteNumber(current && current.x);
+    const currentY = finiteNumber(current && current.y);
+    return clampOverlayPosition(
+      {
+        left:
+          (originLeft === null ? 0 : originLeft) +
+          (currentX === null || startX === null ? 0 : currentX - startX),
+        top:
+          (originTop === null ? 0 : originTop) +
+          (currentY === null || startY === null ? 0 : currentY - startY),
+      },
+      viewport,
+      overlay,
+      inset,
+    );
+  }
+
+  function summaryClickTransition(expanded, suppressNextClick) {
+    return {
+      expanded: suppressNextClick ? Boolean(expanded) : !expanded,
+      suppressNextClick: false,
+    };
+  }
+
   const testExports = {
     BILLING_ENDPOINT,
     CURRENT_ENDPOINT,
     LEGACY_ENDPOINT,
     activeFailureCanCommit,
+    activeBillingStatus,
     activeBusinessTrial,
+    billingFailureMessage,
+    billingSummaryPart,
     billingDataFromPayload,
     billingFailureCanCommit,
     businessTrialDaysRemaining,
@@ -755,19 +949,28 @@
     formatReset,
     formatUpdated,
     isNotionPageUrl,
+    clampOverlayPosition,
     contextTokenMatches,
     cssColorTheme,
     currentUiLanguage,
     currentUiTheme,
+    dragPosition,
+    dragThresholdReached,
+    normalizeBillingStatus,
     normalizeVerdict,
     normalizeBusinessTrial,
     percentage,
+    parseOverlayPosition,
+    planDisplayName,
     pollingInterval,
+    preferredVerticalSide,
     mergeRecipeHeaders,
     requestBodyText,
     responseSequenceIsFresh,
     safeHeaders,
     shouldBootstrapInFrame,
+    subscriptionStatusText,
+    summaryClickTransition,
     uiText,
     usageRefreshPlan,
   };
@@ -794,7 +997,7 @@
   const runtime = {
     nativeFetch: typeof root.fetch === 'function' ? root.fetch : null,
     snapshot: null,
-    businessTrial: null,
+    billingStatus: null,
     spaceId: null,
     activeUserId: null,
     recipeHeaders: {},
@@ -824,6 +1027,7 @@
     billingRefreshTimer: null,
     billingRefreshDueAt: 0,
     error: '',
+    billingError: '',
     ui: null,
   };
 
@@ -835,17 +1039,292 @@
     }
   }
 
+  function currentErrorText() {
+    return [runtime.error, runtime.billingError]
+      .filter((message) => typeof message === 'string' && message.length > 0)
+      .join(uiText('；', '; '));
+  }
+
+  function viewportSize() {
+    const documentElement = root.document && root.document.documentElement;
+    return {
+      width: Math.max(
+        0,
+        finiteNumber(root.innerWidth) ||
+          finiteNumber(documentElement && documentElement.clientWidth) ||
+          0,
+      ),
+      height: Math.max(
+        0,
+        finiteNumber(root.innerHeight) ||
+          finiteNumber(documentElement && documentElement.clientHeight) ||
+          0,
+      ),
+    };
+  }
+
+  function persistOverlayPosition(position) {
+    const left = finiteNumber(position && position.left);
+    const top = finiteNumber(position && position.top);
+    if (left === null || top === null) return;
+    try {
+      const stored = { v: 1, left: Math.round(left), top: Math.round(top) };
+      const ui = runtime.ui;
+      if (ui && (ui.host.dataset.side === 'left' || ui.host.dataset.side === 'right')) {
+        stored.side = ui.host.dataset.side;
+      }
+      if (
+        ui &&
+        (ui.host.dataset.verticalSide === 'up' ||
+          ui.host.dataset.verticalSide === 'down')
+      ) {
+        stored.verticalSide = ui.host.dataset.verticalSide;
+      }
+      root.localStorage.setItem(
+        POSITION_KEY,
+        JSON.stringify(stored),
+      );
+    } catch {
+      // Position persistence is optional.
+    }
+  }
+
+  function storedOverlayPosition() {
+    try {
+      return parseOverlayPosition(root.localStorage.getItem(POSITION_KEY));
+    } catch {
+      return null;
+    }
+  }
+
+  function overlaySide(rect, viewport = viewportSize()) {
+    if (!rect) return 'right';
+    return rect.left + rect.width / 2 <= viewport.width / 2 ? 'left' : 'right';
+  }
+
+  function preferredVerticalSide(summaryRect, requiredHeight, viewport = viewportSize()) {
+    if (!summaryRect) return 'down';
+    const safeRequiredHeight = Math.max(0, finiteNumber(requiredHeight) || 0);
+    const spaceAbove = Math.max(0, summaryRect.top - POSITION_INSET);
+    const spaceBelow = Math.max(0, viewport.height - summaryRect.bottom - POSITION_INSET);
+    if (safeRequiredHeight <= spaceBelow) return 'down';
+    if (safeRequiredHeight <= spaceAbove) return 'up';
+    return spaceAbove > spaceBelow ? 'up' : 'down';
+  }
+
+  function applyOverlayPosition(position, options = {}) {
+    const ui = runtime.ui;
+    if (!ui) return null;
+    const previousPosition = ui.position;
+    const rect = ui.host.getBoundingClientRect();
+    const viewport = viewportSize();
+    const clamped = clampOverlayPosition(
+      position,
+      viewport,
+      { width: rect.width, height: rect.height },
+      POSITION_INSET,
+    );
+    const normalized = {
+      left: Math.round(clamped.left),
+      top: Math.round(clamped.top),
+    };
+    ui.host.style.left = `${normalized.left}px`;
+    ui.host.style.top = `${normalized.top}px`;
+    ui.host.style.right = 'auto';
+    ui.host.style.bottom = 'auto';
+    ui.position = normalized;
+    ui.host.dataset.side =
+      options.side === 'left' || options.side === 'right'
+        ? options.side
+        : overlaySide(
+            { left: normalized.left, width: rect.width },
+            viewport,
+          );
+    if (
+      options.persist &&
+      (!previousPosition ||
+        previousPosition.left !== normalized.left ||
+        previousPosition.top !== normalized.top)
+    ) {
+      persistOverlayPosition(normalized);
+    }
+    return normalized;
+  }
+
+  function restoreOverlayPosition() {
+    const position = storedOverlayPosition();
+    if (!position || !runtime.ui) return;
+    if (position.side === 'left' || position.side === 'right') {
+      runtime.ui.host.dataset.side = position.side;
+    }
+    if (position.verticalSide === 'up' || position.verticalSide === 'down') {
+      runtime.ui.host.dataset.verticalSide = position.verticalSide;
+    }
+    applyOverlayPosition(position, { persist: true, side: position.side });
+  }
+
+  function keepOverlayInViewport(persist = false) {
+    if (!runtime.ui || !runtime.ui.position) return;
+    applyOverlayPosition(runtime.ui.position, {
+      persist,
+      side: runtime.ui.host.dataset.side,
+    });
+  }
+
   function setExpanded(expanded) {
     if (!runtime.ui) return;
-    runtime.ui.expanded = expanded;
-    runtime.ui.card.hidden = !expanded;
-    runtime.ui.summary.setAttribute('aria-expanded', String(expanded));
-    runtime.ui.chevron.textContent = expanded ? '▴' : '▾';
+    const ui = runtime.ui;
+    const nextExpanded = Boolean(expanded);
+    const positionBefore = ui.position ? { ...ui.position } : null;
+    const summaryBefore = positionBefore ? ui.summary.getBoundingClientRect() : null;
+    const side = summaryBefore ? overlaySide(summaryBefore) : null;
+    if (side) ui.host.dataset.side = side;
+
+    ui.expanded = nextExpanded;
+    ui.card.hidden = !nextExpanded;
+    ui.summary.setAttribute('aria-expanded', String(nextExpanded));
+    ui.chevron.textContent = nextExpanded ? '▴' : '▾';
+
+    if (positionBefore && summaryBefore) {
+      if (nextExpanded) {
+        const cardHeight = ui.card.getBoundingClientRect().height;
+        ui.host.dataset.verticalSide = preferredVerticalSide(
+          summaryBefore,
+          cardHeight + 7,
+        );
+      }
+      const summaryAfter = ui.summary.getBoundingClientRect();
+      applyOverlayPosition(
+        {
+          left: positionBefore.left + summaryBefore.left - summaryAfter.left,
+          top: positionBefore.top + summaryBefore.top - summaryAfter.top,
+        },
+        { persist: true, side },
+      );
+      persistOverlayPosition(ui.position);
+    }
     try {
-      root.localStorage.setItem(EXPANDED_KEY, expanded ? '1' : '0');
+      root.localStorage.setItem(EXPANDED_KEY, nextExpanded ? '1' : '0');
     } catch {
       // Preference persistence is optional.
     }
+  }
+
+  function interactiveDragTarget(target) {
+    if (!target || typeof target.closest !== 'function') return false;
+    return Boolean(
+      target.closest(
+        'button, a, input, select, textarea, [role="button"], [contenteditable="true"], .preview-help',
+      ),
+    );
+  }
+
+  function installDragHandle(handle, options = {}) {
+    const ui = runtime.ui;
+    if (!ui || !handle) return;
+    let activeDrag = null;
+
+    const finishDrag = (event, canceled) => {
+      if (!activeDrag || event.pointerId !== activeDrag.pointerId) return;
+      const completedDrag = activeDrag;
+      activeDrag = null;
+      ui.shell.removeAttribute('data-dragging');
+      if (completedDrag.dragged && ui.position) {
+        if (event.cancelable) event.preventDefault();
+        const finalSide = overlaySide(
+          options.suppressClick
+            ? ui.summary.getBoundingClientRect()
+            : ui.host.getBoundingClientRect(),
+        );
+        if (ui.host.dataset.side !== finalSide) {
+          const summaryBefore = options.suppressClick
+            ? ui.summary.getBoundingClientRect()
+            : null;
+          ui.host.dataset.side = finalSide;
+          if (summaryBefore) {
+            const summaryAfter = ui.summary.getBoundingClientRect();
+            applyOverlayPosition(
+              {
+                left: ui.position.left + summaryBefore.left - summaryAfter.left,
+                top: ui.position.top + summaryBefore.top - summaryAfter.top,
+              },
+              { side: finalSide },
+            );
+          }
+        }
+        persistOverlayPosition(ui.position);
+        if (!canceled && options.suppressClick) {
+          ui.suppressSummaryClick = true;
+          root.setTimeout(() => {
+            if (runtime.ui === ui) ui.suppressSummaryClick = false;
+          }, 500);
+        }
+      }
+      try {
+        if (
+          typeof handle.hasPointerCapture === 'function' &&
+          handle.hasPointerCapture(completedDrag.pointerId)
+        ) {
+          handle.releasePointerCapture(completedDrag.pointerId);
+        }
+      } catch {
+        // The browser may already have released capture during cancellation.
+      }
+    };
+
+    handle.addEventListener('pointerdown', (event) => {
+      if (activeDrag || event.isPrimary === false || event.button !== 0) return;
+      if (options.ignoreInteractive && interactiveDragTarget(event.target)) return;
+      if (options.suppressClick) ui.suppressSummaryClick = false;
+      const rect = ui.host.getBoundingClientRect();
+      activeDrag = {
+        pointerId: event.pointerId,
+        origin: { left: rect.left, top: rect.top },
+        start: { x: event.clientX, y: event.clientY },
+        size: { width: rect.width, height: rect.height },
+        side:
+          ui.host.dataset.side === 'left' || ui.host.dataset.side === 'right'
+            ? ui.host.dataset.side
+            : overlaySide(ui.summary.getBoundingClientRect()),
+        dragged: false,
+      };
+      try {
+        if (typeof handle.setPointerCapture === 'function') {
+          handle.setPointerCapture(event.pointerId);
+        }
+      } catch {
+        // Pointer capture is an enhancement; keep the normal pointer stream intact.
+      }
+    });
+
+    handle.addEventListener('pointermove', (event) => {
+      if (!activeDrag || event.pointerId !== activeDrag.pointerId) return;
+      const current = { x: event.clientX, y: event.clientY };
+      activeDrag.dragged = dragThresholdReached(
+        activeDrag.dragged,
+        activeDrag.start,
+        current,
+        DRAG_THRESHOLD,
+      );
+      if (!activeDrag.dragged) return;
+      if (event.cancelable) event.preventDefault();
+      ui.shell.dataset.dragging = 'true';
+      applyOverlayPosition(
+        dragPosition(
+          activeDrag.origin,
+          activeDrag.start,
+          current,
+          viewportSize(),
+          activeDrag.size,
+          POSITION_INSET,
+        ),
+        { side: activeDrag.side },
+      );
+    });
+
+    handle.addEventListener('pointerup', (event) => finishDrag(event, false));
+    handle.addEventListener('pointercancel', (event) => finishDrag(event, true));
+    handle.addEventListener('lostpointercapture', (event) => finishDrag(event, true));
   }
 
   function metricTone(percent) {
@@ -888,35 +1367,160 @@
     return language === 'zh' ? `${formatted} 结束` : `Ends ${formatted}`;
   }
 
-  function renderBusinessTrial(elements, trial, nowMs) {
-    if (!trial) {
+  function planDisplayName(plan) {
+    if (plan === 'free') return 'Free';
+    if (plan === 'business') return 'Business';
+    if (plan === 'enterprise' || plan === 'enterprise_limited') return 'Enterprise';
+    if (plan === 'plus' || plan === 'personal' || plan === 'student') return 'Plus';
+    return uiText('未知', 'Unknown');
+  }
+
+  function subscriptionStatusText(status) {
+    const labels = {
+      active: uiText('有效', 'Active'),
+      trialing: uiText('试用中', 'Trialing'),
+      past_due: uiText('逾期', 'Past due'),
+      unpaid: uiText('未付款', 'Unpaid'),
+      paused: uiText('已暂停', 'Paused'),
+      canceled: uiText('已取消', 'Canceled'),
+      incomplete: uiText('未完成', 'Incomplete'),
+      incomplete_expired: uiText('已失效', 'Expired'),
+      none: uiText('未订阅', 'No subscription'),
+      unknown: uiText('状态未知', 'Status unavailable'),
+    };
+    return labels[status] || labels.unknown;
+  }
+
+  function formatSubscriptionPeriod(timestamp) {
+    if (!Number.isFinite(timestamp)) return '';
+    const language = currentUiLanguage();
+    const formatted = new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(timestamp));
+    return language === 'zh' ? `当前周期至 ${formatted}` : `Current period ends ${formatted}`;
+  }
+
+  function billingSummaryPart(billingStatus, nowMs) {
+    if (!billingStatus) return null;
+    if (billingStatus.kind === 'none') return null;
+    if (billingStatus.kind === 'trial') {
+      const days = businessTrialDaysRemaining(billingStatus, nowMs);
+      return businessTrialEndsToday(billingStatus, nowMs)
+        ? uiText('试用 今天结束', 'Trial ends today')
+        : uiText(`试用 ${days}天`, `Trial ${days}d`);
+    }
+    return `${planDisplayName(billingStatus.plan)} · ${subscriptionStatusText(billingStatus.status)}`;
+  }
+
+  function renderBillingStatus(elements, billingStatus, nowMs) {
+    if (!billingStatus) {
       elements.row.hidden = true;
       return;
     }
-    const remainingDays = businessTrialDaysRemaining(trial, nowMs);
-    const endsToday = businessTrialEndsToday(trial, nowMs);
+
     elements.row.hidden = false;
-    elements.label.textContent = uiText('Business 试用', 'Business Trial');
-    elements.remaining.textContent = endsToday
-      ? uiText('今天结束', 'Ends today')
-      : uiText(`剩余 ${remainingDays} 天`, `${remainingDays} days left`);
-    elements.end.textContent = formatTrialEnd(trial.endAt);
-    elements.row.title = uiText(
-      `Business 试用：${formatAbsoluteTime(trial.startAt)} — ${formatAbsoluteTime(trial.endAt)}`,
-      `Business Trial: ${formatAbsoluteTime(trial.startAt)} — ${formatAbsoluteTime(trial.endAt)}`,
-    );
+    if (billingStatus.kind === 'none') {
+      elements.row.dataset.kind = 'none';
+      elements.label.textContent = uiText('Free 套餐', 'Free Plan');
+      elements.value.textContent = subscriptionStatusText('none');
+      elements.end.hidden = true;
+      elements.end.textContent = '';
+      elements.row.title = uiText('Free 套餐：未订阅', 'Free Plan: No subscription');
+      return;
+    }
+
+    if (billingStatus.kind === 'trial') {
+      const remainingDays = businessTrialDaysRemaining(billingStatus, nowMs);
+      const endsToday = businessTrialEndsToday(billingStatus, nowMs);
+      elements.row.dataset.kind = 'trial';
+      elements.label.textContent = uiText('Business 试用', 'Business Trial');
+      elements.value.textContent = endsToday
+        ? uiText('今天结束', 'Ends today')
+        : uiText(`剩余 ${remainingDays} 天`, `${remainingDays} days left`);
+      elements.end.hidden = false;
+      elements.end.textContent = formatTrialEnd(billingStatus.endAt);
+      elements.row.title = uiText(
+        `Business 试用：${formatAbsoluteTime(billingStatus.startAt)} — ${formatAbsoluteTime(billingStatus.endAt)}`,
+        `Business Trial: ${formatAbsoluteTime(billingStatus.startAt)} — ${formatAbsoluteTime(billingStatus.endAt)}`,
+      );
+      return;
+    }
+
+    const planName = planDisplayName(billingStatus.plan);
+    const statusText = subscriptionStatusText(billingStatus.status);
+    const periodText = formatSubscriptionPeriod(billingStatus.currentPeriodEndAt);
+    elements.row.dataset.kind = 'subscription';
+    elements.label.textContent = uiText(`${planName} 套餐`, `${planName} Plan`);
+    elements.value.textContent = statusText;
+    elements.end.hidden = !periodText;
+    elements.end.textContent = periodText;
+    elements.row.title = periodText
+      ? uiText(
+          `${planName} 套餐：${statusText}；${periodText}`,
+          `${planName} Plan: ${statusText}; ${periodText}`,
+        )
+      : uiText(`${planName} 套餐：${statusText}`, `${planName} Plan: ${statusText}`);
   }
 
   function setSummaryParts(container, parts) {
-    const values = parts.filter((part) => typeof part === 'string' && part.length > 0);
+    const values = parts
+      .filter((part) => isRecord(part) && typeof part.text === 'string' && part.text.length > 0)
+      .map((part) => ({
+        text: part.text,
+        separator:
+          part.separator === 'usage' || part.separator === 'billing'
+            ? part.separator
+            : 'none',
+      }));
+    const currentValues = Array.from(container.children, (node) => ({
+      text: node.textContent || '',
+      separator: node.dataset.separator || 'none',
+    }));
+    if (
+      currentValues.length === values.length &&
+      currentValues.every(
+        (value, index) =>
+          value.text === values[index].text &&
+          value.separator === values[index].separator,
+      )
+    ) {
+      container.setAttribute('aria-label', values.map((value) => value.text).join('，'));
+      return;
+    }
+    const ui = runtime.ui;
+    const preserveAnchor = Boolean(
+      ui &&
+        ui.position &&
+        ui.summaryText === container &&
+        !ui.expanded &&
+        !ui.shell.hasAttribute('data-dragging'),
+    );
+    const summaryBefore = preserveAnchor ? ui.summary.getBoundingClientRect() : null;
     const nodes = values.map((value) => {
       const part = container.ownerDocument.createElement('span');
       part.className = 'summary-part';
-      part.textContent = value;
+      part.dataset.separator = value.separator;
+      part.textContent = value.text;
       return part;
     });
     container.replaceChildren(...nodes);
-    container.setAttribute('aria-label', values.join('，'));
+    container.setAttribute('aria-label', values.map((value) => value.text).join('，'));
+    if (preserveAnchor && summaryBefore) {
+      const summaryAfter = ui.summary.getBoundingClientRect();
+      const side = ui.host.dataset.side === 'left' ? 'left' : 'right';
+      const horizontalShift =
+        side === 'right'
+          ? summaryBefore.right - summaryAfter.right
+          : summaryBefore.left - summaryAfter.left;
+      applyOverlayPosition(
+        { left: ui.position.left + horizontalShift, top: ui.position.top },
+        { persist: true, side },
+      );
+    }
   }
 
   function updateStaticUiCopy(ui, isLoading, isPreview) {
@@ -946,13 +1550,9 @@
     if (!ui) return;
     const snapshot = runtime.snapshot;
     const nowMs = Date.now();
-    const trial = activeBusinessTrial(runtime.businessTrial, nowMs);
-    const trialDays = trial ? businessTrialDaysRemaining(trial, nowMs) : null;
-    const trialPart = trial
-      ? businessTrialEndsToday(trial, nowMs)
-        ? uiText('试用 今天结束', 'Trial ends today')
-        : uiText(`试用 ${trialDays}天`, `Trial ${trialDays}d`)
-      : null;
+    const billingStatus = activeBillingStatus(runtime.billingStatus, nowMs);
+    const billingPart = billingSummaryPart(billingStatus, nowMs);
+    const errorText = currentErrorText();
 
     const cooldownUntil = runtime.lastFetchedAt + MIN_REFRESH_INTERVAL;
     const isLoading = runtime.fetching || runtime.billingFetching;
@@ -962,21 +1562,24 @@
       (runtime.activeRefreshDisabled && runtime.billingRefreshDisabled) ||
       !runtime.spaceId ||
       nowMs < Math.max(runtime.nextAllowedAt, cooldownUntil);
-    renderBusinessTrial(ui.trial, trial, nowMs);
+    renderBillingStatus(ui.billing, billingStatus, nowMs);
 
     if (!snapshot) {
+      const waitingText =
+        runtime.fetching || runtime.billingFetching
+          ? uiText('读取中', 'Loading')
+          : uiText('等待', 'Waiting');
       setSummaryParts(ui.summaryText, [
-        uiText('AI 用量', 'AI Usage'),
-        trialPart ||
-          (runtime.fetching || runtime.billingFetching
-            ? uiText('读取中', 'Loading')
-            : uiText('等待', 'Waiting')),
+        { text: uiText('AI 用量', 'AI Usage') },
+        billingPart
+          ? { text: billingPart, separator: 'billing' }
+          : { text: waitingText, separator: 'usage' },
       ]);
-      ui.dot.dataset.status = runtime.error ? 'error' : 'waiting';
+      ui.dot.dataset.status = errorText ? 'error' : 'waiting';
       ui.notice.hidden = false;
-      ui.notice.dataset.kind = runtime.error ? 'error' : 'info';
+      ui.notice.dataset.kind = errorText ? 'error' : 'info';
       ui.notice.textContent =
-        runtime.error ||
+        errorText ||
         (runtime.spaceId
           ? uiText('正在读取 Notion AI 用量…', 'Loading Notion AI usage…')
           : uiText(
@@ -985,39 +1588,44 @@
             ));
       ui.rolling.row.hidden = true;
       ui.monthly.row.hidden = true;
-      ui.metrics.hidden = !trial;
-      ui.updated.textContent = trial
+      ui.metrics.hidden = !billingStatus;
+      ui.updated.textContent = billingStatus
         ? uiText(
-            `${formatUpdated(trial.updatedAt, nowMs)} — Notion 同源接口`,
-            `${formatUpdated(trial.updatedAt, nowMs)} — Notion same-origin API`,
+            `${formatUpdated(billingStatus.updatedAt, nowMs)} — Notion 同源接口`,
+            `${formatUpdated(billingStatus.updatedAt, nowMs)} — Notion same-origin API`,
           )
         : uiText('尚未取得有效数据', 'No valid data yet');
+      keepOverlayInViewport(true);
       return;
     }
 
     if (snapshot.status === 'not_applicable') {
       setSummaryParts(ui.summaryText, [
-        uiText('AI 用量', 'AI Usage'),
-        uiText('不适用', 'Not applicable'),
-        trialPart,
+        { text: uiText('AI 用量', 'AI Usage') },
+        { text: uiText('不适用', 'Not applicable'), separator: 'usage' },
+        billingPart ? { text: billingPart, separator: 'billing' } : null,
       ]);
       ui.dot.dataset.status = 'neutral';
       ui.notice.hidden = false;
-      ui.notice.dataset.kind = 'info';
-      ui.notice.textContent = uiText(
-        'Notion 返回 not_applicable：当前账户或套餐没有可展示的 AI 用量窗口。',
-        'Notion returned not_applicable: this account or plan has no AI usage window to display.',
-      );
+      ui.notice.dataset.kind = errorText ? 'error' : 'info';
+      ui.notice.textContent =
+        errorText ||
+        uiText(
+          'Notion 返回 not_applicable：当前账户或套餐没有可展示的 AI 用量窗口。',
+          'Notion returned not_applicable: this account or plan has no AI usage window to display.',
+        );
       ui.rolling.row.hidden = true;
       ui.monthly.row.hidden = true;
-      ui.metrics.hidden = !trial;
+      ui.metrics.hidden = !billingStatus;
     } else {
       const activeMonthly =
         snapshot.monthly && snapshot.monthly.resetAt > nowMs ? snapshot.monthly : null;
       setSummaryParts(ui.summaryText, [
-        `AI ${formatPercent(snapshot.rolling.percent)}`,
-        activeMonthly ? formatPercent(activeMonthly.percent) : null,
-        trialPart,
+        { text: `AI ${formatPercent(snapshot.rolling.percent)}` },
+        activeMonthly
+          ? { text: formatPercent(activeMonthly.percent), separator: 'usage' }
+          : null,
+        billingPart ? { text: billingPart, separator: 'billing' } : null,
       ]);
       ui.dot.dataset.status = snapshot.status === 'rate_limited' ? 'error' : 'ok';
       ui.metrics.hidden = false;
@@ -1028,30 +1636,35 @@
       if (snapshot.status === 'rate_limited') {
         ui.notice.hidden = false;
         ui.notice.dataset.kind = 'error';
-        ui.notice.textContent =
+        const limitText =
           snapshot.limitedBy === 'billing_period'
             ? uiText('已达到月度额度上限。', 'The monthly allowance has been reached.')
             : uiText(
                 '已达到当前滚动窗口的额度上限。',
                 'The current rolling-window allowance has been reached.',
               );
-      } else if (runtime.error) {
+        ui.notice.textContent = errorText ? `${limitText} ${errorText}` : limitText;
+      } else if (errorText) {
         ui.notice.hidden = false;
         ui.notice.dataset.kind = 'error';
         ui.notice.textContent = uiText(
-          `${runtime.error}（继续显示最后一次有效数据）`,
-          `${runtime.error} (showing the last valid data)`,
+          `${errorText}（继续显示可用的最后有效数据）`,
+          `${errorText} (showing the last valid data where available)`,
         );
       } else {
         ui.notice.hidden = true;
       }
     }
 
-    const newestUpdate = Math.max(snapshot.updatedAt, trial ? trial.updatedAt : 0);
+    const newestUpdate = Math.max(
+      snapshot.updatedAt,
+      billingStatus ? billingStatus.updatedAt : 0,
+    );
     ui.updated.textContent = uiText(
       `${formatUpdated(newestUpdate, nowMs)} — Notion 同源接口`,
       `${formatUpdated(newestUpdate, nowMs)} — Notion same-origin API`,
     );
+    keepOverlayInViewport(true);
   }
 
   function buildMetricRow(documentRef, key) {
@@ -1075,22 +1688,22 @@
     };
   }
 
-  function buildTrialRow(documentRef) {
+  function buildBillingRow(documentRef) {
     const row = documentRef.createElement('div');
-    row.className = 'metric trial';
-    row.dataset.metric = 'business-trial';
+    row.className = 'metric billing';
+    row.dataset.metric = 'billing-status';
     row.innerHTML = trustedHtml(`
       <div class="metric-head">
         <span class="metric-label">Business Trial</span>
-        <span class="trial-remaining"></span>
+        <span class="billing-value"></span>
       </div>
-      <div class="metric-reset trial-end"></div>
+      <div class="metric-reset billing-end"></div>
     `);
     return {
       row,
       label: row.querySelector('.metric-label'),
-      remaining: row.querySelector('.trial-remaining'),
-      end: row.querySelector('.trial-end'),
+      value: row.querySelector('.billing-value'),
+      end: row.querySelector('.billing-end'),
     };
   }
 
@@ -1121,7 +1734,7 @@
           --usage-row-divider: rgba(255,255,255,.08);
           --usage-bar: rgba(255,255,255,.10);
           --usage-value: #c7c7c7;
-          --usage-trial: #d9c4ff;
+          --usage-billing: #d9c4ff;
           --usage-info-text: #c6dfff;
           --usage-info-bg: rgba(58,132,217,.14);
           --usage-error-text: #ffc5c5;
@@ -1130,11 +1743,15 @@
           --usage-tooltip-bg: #2f2f2f;
           --usage-tooltip-border: rgba(255,255,255,.12);
           --usage-shadow: 0 14px 42px rgba(0,0,0,.36);
+          --usage-summary-item-gap: 11px;
+          --usage-summary-separator-space: 12px;
+          display: block;
           position: fixed;
           top: 16px;
           right: 16px;
           z-index: 2147483646;
-          width: min(336px, calc(100vw - 24px));
+          width: max-content;
+          max-width: calc(100vw - 32px);
           color: var(--usage-text);
           font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
           font-size: 13px;
@@ -1156,7 +1773,7 @@
           --usage-row-divider: rgba(15,15,15,.09);
           --usage-bar: rgba(15,15,15,.10);
           --usage-value: #555;
-          --usage-trial: #6940a5;
+          --usage-billing: #6940a5;
           --usage-info-text: #24588f;
           --usage-info-bg: rgba(46,119,190,.11);
           --usage-error-text: #a62d2f;
@@ -1174,21 +1791,25 @@
           flex-direction: column;
           gap: 7px;
         }
+        :host([data-side="left"]) .shell { align-items: flex-start; }
+        :host([data-vertical-side="up"]) .shell { flex-direction: column-reverse; }
         .summary {
           pointer-events: auto;
           display: inline-flex;
           align-items: center;
-          gap: 8px;
-          min-height: 34px;
+          gap: var(--usage-summary-item-gap);
+          min-height: 38px;
           max-width: 100%;
-          padding: 7px 11px;
+          padding: 8px 13px;
           border: 1px solid var(--usage-border);
           border-radius: 999px;
           color: var(--usage-text);
           background: var(--usage-summary);
           box-shadow: 0 7px 24px rgba(0,0,0,.20);
           backdrop-filter: blur(14px);
-          cursor: pointer;
+          cursor: grab;
+          touch-action: none;
+          user-select: none;
         }
         .summary:hover { background: var(--usage-summary-hover); }
         .summary:focus-visible, .action:focus-visible {
@@ -1217,25 +1838,26 @@
           letter-spacing: .01em;
         }
         .summary-part { flex: 0 0 auto; }
-        .summary-part:nth-child(2)::before {
+        .summary-part:first-child { word-spacing: 2px; }
+        .summary-part[data-separator="usage"]::before {
           content: "·";
           display: inline;
-          margin: 0 9px;
+          margin: 0 var(--usage-summary-separator-space);
           color: var(--usage-muted);
         }
-        .summary-part:nth-child(n+3)::before {
+        .summary-part[data-separator="billing"]::before {
           content: "";
           display: inline-block;
           width: 1px;
           height: 14px;
-          margin: 0 9px;
+          margin: 0 var(--usage-summary-separator-space);
           vertical-align: -2px;
           background: var(--usage-divider);
         }
-        .chevron { color: var(--usage-muted); font-size: 11px; }
+        .chevron { flex: 0 0 auto; color: var(--usage-muted); font-size: 11px; }
         .card {
           pointer-events: auto;
-          width: 100%;
+          width: min(336px, calc(100vw - 32px));
           overflow: hidden;
           border: 1px solid var(--usage-border);
           border-radius: 14px;
@@ -1250,7 +1872,12 @@
           align-items: center;
           justify-content: space-between;
           padding: 12px 14px 10px;
+          cursor: grab;
+          touch-action: none;
+          user-select: none;
         }
+        .shell[data-dragging="true"] .summary,
+        .shell[data-dragging="true"] .header { cursor: grabbing; }
         .title-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
         .title { font-size: 14px; font-weight: 720; }
         .preview-help {
@@ -1359,12 +1986,12 @@
         .metric-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
         .metric-label { font-weight: 620; }
         .metric-percent { color: var(--usage-value); font-variant-numeric: tabular-nums; }
-        .trial-remaining {
-          color: var(--usage-trial);
+        .billing-value {
+          color: var(--usage-billing);
           font-weight: 650;
           font-variant-numeric: tabular-nums;
         }
-        .trial-end { margin-top: 5px; }
+        .billing-end { margin-top: 5px; }
         .bar {
           width: 100%;
           height: 5px;
@@ -1397,7 +2024,8 @@
         }
         .footer-actions { display: flex; gap: 5px; }
         @media (max-width: 520px) {
-          :host { top: 9px; right: 9px; width: min(324px, calc(100vw - 18px)); }
+          :host { top: 9px; right: 9px; max-width: calc(100vw - 18px); }
+          .card { width: min(324px, calc(100vw - 18px)); }
         }
         @media (prefers-reduced-motion: reduce) {
           .bar-fill { transition: none; }
@@ -1453,17 +2081,19 @@
     const metrics = shadow.querySelector('.metrics');
     const rolling = buildMetricRow(root.document, 'rolling');
     const monthly = buildMetricRow(root.document, 'monthly');
-    const trial = buildTrialRow(root.document);
-    metrics.append(rolling.row, monthly.row, trial.row);
+    const billing = buildBillingRow(root.document);
+    metrics.append(rolling.row, monthly.row, billing.row);
 
     runtime.ui = {
       host,
       shadow,
+      shell: shadow.querySelector('.shell'),
       summary: shadow.querySelector('.summary'),
       summaryText: shadow.querySelector('.summary-text'),
       dot: shadow.querySelector('.dot'),
       chevron: shadow.querySelector('.chevron'),
       card: shadow.querySelector('.card'),
+      header: shadow.querySelector('.header'),
       title: shadow.querySelector('.title'),
       previewHelp: shadow.querySelector('.preview-help'),
       previewTooltip: shadow.querySelector('.preview-tooltip'),
@@ -1471,16 +2101,30 @@
       metrics,
       rolling,
       monthly,
-      trial,
+      billing,
       refresh: shadow.querySelector('.refresh'),
       nativePage: shadow.querySelector('.native-page'),
       updated: shadow.querySelector('.updated'),
       expanded: false,
+      position: null,
+      suppressSummaryClick: false,
     };
 
-    runtime.ui.summary.addEventListener('click', () => setExpanded(!runtime.ui.expanded));
+    runtime.ui.summary.addEventListener('click', () => {
+      const transition = summaryClickTransition(
+        runtime.ui.expanded,
+        runtime.ui.suppressSummaryClick,
+      );
+      runtime.ui.suppressSummaryClick = transition.suppressNextClick;
+      if (transition.expanded !== runtime.ui.expanded) setExpanded(transition.expanded);
+    });
+    runtime.ui.summary.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        runtime.ui.suppressSummaryClick = false;
+      }
+    });
     runtime.ui.refresh.addEventListener('click', () => {
-      refreshBusinessTrial({ force: true, reason: 'manual' });
+      refreshBillingStatus({ force: true, reason: 'manual' });
       refreshUsage({ force: true, reason: 'manual' });
     });
     runtime.ui.nativePage.addEventListener('click', () => {
@@ -1488,6 +2132,8 @@
       target.searchParams.set('target', 'aiusage');
       root.location.assign(target.href);
     });
+    installDragHandle(runtime.ui.summary, { suppressClick: true });
+    installDragHandle(runtime.ui.header, { ignoreInteractive: true });
 
     root.document.body.appendChild(host);
     let expanded = false;
@@ -1497,6 +2143,7 @@
       expanded = false;
     }
     setExpanded(expanded);
+    restoreOverlayPosition();
     render();
   }
 
@@ -1557,7 +2204,7 @@
         runtime.billingRefreshDueAt = 0;
       }
       runtime.snapshot = null;
-      runtime.businessTrial = null;
+      runtime.billingStatus = null;
       runtime.acceptedCurrentResponseSequence = 0;
       runtime.acceptedBillingResponseSequence = 0;
       runtime.lastAttemptAt = 0;
@@ -1566,6 +2213,7 @@
       runtime.lastBillingAttemptAt = 0;
       runtime.billingBackoffUntil = 0;
       runtime.error = '';
+      runtime.billingError = '';
       runtime.nextAllowedAt = 0;
       runtime.backoffMs = 0;
       runtime.activeRefreshDisabled = false;
@@ -1646,7 +2294,7 @@
     return true;
   }
 
-  function acceptBusinessTrialPayload(payload, requestContext = null, sequenceFloor = null) {
+  function acceptBillingStatusPayload(payload, requestContext = null, sequenceFloor = null) {
     if (requestContext && !contextTokenMatches(requestContext, runtime)) return false;
     if (
       requestContext &&
@@ -1655,15 +2303,16 @@
       return false;
     }
 
-    // Project the billing response immediately to a minimal trial-only object.
+    // Project the billing response immediately to a minimal plan-status object.
     // Addresses, payment methods, invoices, balances, and dependencies are never retained.
-    const normalized = normalizeBusinessTrial(payload);
+    const normalized = normalizeBillingStatus(payload);
     if (!normalized) {
-      warn('Unsupported getBillingData trial schema; keeping the last valid trial state.');
+      warn('Unsupported getBillingData plan schema; keeping the last valid billing state.');
       return false;
     }
 
-    runtime.businessTrial = normalized.status === 'active' ? normalized : null;
+    runtime.billingStatus = normalized;
+    runtime.billingError = '';
     if (requestContext) {
       runtime.acceptedBillingResponseSequence = requestContext.sequence;
     } else if (Number.isSafeInteger(sequenceFloor)) {
@@ -1698,11 +2347,11 @@
           ? await readBillingJson(response.clone())
           : await response.clone().json();
       if (!contextTokenMatches(requestContext, runtime)) return;
-      if (kind === 'billing') acceptBusinessTrialPayload(payload, requestContext);
+      if (kind === 'billing') acceptBillingStatusPayload(payload, requestContext);
       else acceptPayload(payload, kind, requestContext);
     } catch {
       if (kind === 'current') warn('Could not decode the current usage response as JSON.');
-      if (kind === 'billing') warn('Could not decode the Business Trial billing response.');
+      if (kind === 'billing') warn('Could not decode the workspace billing response.');
     }
   }
 
@@ -1875,12 +2524,12 @@
                   }
                   payload = JSON.parse(this.responseText);
                 }
-                if (kind === 'billing') acceptBusinessTrialPayload(payload, requestContext);
+                if (kind === 'billing') acceptBillingStatusPayload(payload, requestContext);
                 else acceptPayload(payload, kind, requestContext);
               } catch {
                 warn(
                   kind === 'billing'
-                    ? 'Could not decode the XHR Business Trial response.'
+                    ? 'Could not decode the XHR workspace billing response.'
                     : 'Could not decode the XHR usage response as JSON.',
                 );
               }
@@ -1934,7 +2583,7 @@
     else runtime.error = uiText('暂时无法读取 Notion AI 用量', 'Unable to load Notion AI usage');
   }
 
-  async function refreshBusinessTrial(options = {}) {
+  async function refreshBillingStatus(options = {}) {
     const nowMs = Date.now();
     if (
       !runtime.nativeFetch ||
@@ -1996,7 +2645,7 @@
         return false;
       }
       if (runtime.acceptedBillingResponseSequence > passiveSequenceAtStart) return false;
-      if (!acceptBusinessTrialPayload(payload, null, passiveSequenceAtStart)) {
+      if (!acceptBillingStatusPayload(payload, null, passiveSequenceAtStart)) {
         throw new Error('unsupported-billing-schema');
       }
       return true;
@@ -2013,6 +2662,7 @@
         return false;
       }
       const status = finiteNumber(error && error.status);
+      runtime.billingError = billingFailureMessage(error);
       if (status === 401 || status === 403) {
         runtime.billingRefreshDisabled = true;
       } else if (status === 429) {
@@ -2171,7 +2821,7 @@
     runtime.billingRefreshTimer = root.setTimeout(() => {
       runtime.billingRefreshTimer = null;
       runtime.billingRefreshDueAt = 0;
-      refreshBusinessTrial({ force: false, reason });
+      refreshBillingStatus({ force: false, reason });
     }, Math.max(0, dueAt - nowMs));
   }
 
@@ -2180,16 +2830,22 @@
     render();
     if (root.document.hidden || !runtime.spaceId) return;
 
+    const nowMs = Date.now();
+    const trialEnded = Boolean(
+      runtime.billingStatus &&
+        runtime.billingStatus.kind === 'trial' &&
+        !activeBusinessTrial(runtime.billingStatus, nowMs),
+    );
     if (
       !runtime.billingFetching &&
-      Date.now() - runtime.lastBillingFetchedAt >= BILLING_REFRESH_INTERVAL
+      (trialEnded || nowMs - runtime.lastBillingFetchedAt >= BILLING_REFRESH_INTERVAL)
     ) {
-      refreshBusinessTrial({ force: false, reason: 'heartbeat' });
+      refreshBillingStatus({ force: trialEnded, reason: trialEnded ? 'trial-ended' : 'heartbeat' });
     }
     if (runtime.fetching) return;
 
     const referenceTime = Math.max(runtime.lastFetchedAt, runtime.lastAttemptAt);
-    if (Date.now() - referenceTime >= pollingInterval(runtime.snapshot)) {
+    if (nowMs - referenceTime >= pollingInterval(runtime.snapshot)) {
       refreshUsage({ force: false, reason: 'heartbeat' });
     }
   }
@@ -2254,6 +2910,7 @@
   root.document.addEventListener('visibilitychange', () => {
     if (!root.document.hidden) runHeartbeat();
   });
+  root.addEventListener('resize', () => keepOverlayInViewport(true), { passive: true });
   root.setInterval(runHeartbeat, 30000);
   root.setInterval(ensureUi, 2500);
 })(

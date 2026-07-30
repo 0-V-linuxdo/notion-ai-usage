@@ -1,22 +1,30 @@
-# [Notion AI] Usage [20260730] v1.0.0
+# [Notion AI] Usage [20260730] v1.1.0
 
-当前发布版本：`[20260730] v1.0.0`。用户脚本的机器版本为 `20260730.1.0.0`，以符合 Violentmonkey 的版本比较格式。
+当前发布版本：`[20260730] v1.1.0`。用户脚本的机器版本为 `20260730.1.1.0`，以符合 Violentmonkey 的版本比较格式。
 
-在 Notion 页面右上角显示 AI 的滚动用量、月度用量，以及当前工作区 Business Trial 的剩余天数和准确结束时间。脚本使用 Notion 自己的同源接口和当前登录态，不读取、不保存、也不外传 Cookie、`token_v2` 或 Authorization。
+在 Notion 页面右上角显示 AI 的滚动用量、月度用量，以及当前工作区的正常订阅状态或 Business Trial 剩余时间。脚本使用 Notion 自己的同源接口和当前登录态，不读取、不保存、也不外传 Cookie、`token_v2` 或 Authorization。
 
 Notion 官方目前把额度分成「滚动六小时窗口」和「月度窗口」；原生入口是 `Settings → Notion AI → Usage`。Business Plan 通用试用通常为 30 天，但活动期限并不固定，所以脚本只采用服务端返回的实际结束时间，不用固定天数倒推。参见 [AI 用量说明](https://www.notion.com/en-gb/help/manage-your-usage-allowance-for-notion-ai)与 [付费套餐试用说明](https://www.notion.com/en-gb/help/paid-plan-trials)。
 
+## 截图
+
+![等待获取 Notion AI 用量数据的折叠胶囊](./docs/images/notion-ai-usage-waiting.png)
+
+![展开的 Notion AI Usage 卡片，显示用量与 Business Trial 状态](./docs/images/notion-ai-usage-business-trial.png)
+
 ## 功能
 
-- 固定小胶囊，展开后显示当前会话、月度用量、百分比和重置时间。
+- 可拖拽小胶囊，展开后显示当前会话、月度用量、百分比和重置时间；折叠时拖动胶囊、展开时拖动卡片标题栏，位置会在当前站点持久保存，靠近窗口底部时卡片会自动向上展开。
+- 正常付费工作区显示套餐与订阅状态，例如 `Business · Active`；展开后显示当前账单周期结束时间。
 - 若当前工作区处于 Business Trial，额外显示 `剩余 N 天` 与精确结束日期；兼容独立 trial 与 subscription-backed trial。
+- 将未订阅、未知套餐或订阅状态与尚未加载区分显示，不把未知值猜成 Free 或有效订阅。
 - 自动跟随 Notion UI 语言：`zh-*` 使用中文，其余语言使用英文。
 - 自动跟随 Notion 自身的普通/黑暗主题，并在页面内切换主题时实时更新。
-- 用量百分比之间保留圆点，Trial 前使用 1 px 竖线；刷新使用带无障碍标签的 SVG 图标按钮。
+- 状态点、首段用量和分隔符之间采用更宽松的间距；用量百分比之间保留圆点，套餐或 Trial 前使用 1 px 竖线；刷新使用带无障碍标签的 SVG 图标按钮。
 - 刷新图标按 [Lucide `refresh-cw`](https://lucide.dev/icons/refresh-cw) 的官方 24 px 路径重绘。
 - `preview` 说明收进标题右侧的信息图标，鼠标悬停或键盘聚焦时显示。
 - 支持 `within_limit`、`rate_limited`、`not_applicable` 三种状态。
-- 用量常规主动轮询约每 60 秒；账单试用数据最多每小时读取一次；页面隐藏时暂停，错误时退避。
+- 用量常规主动轮询约每 60 秒；账单与试用数据最多每小时读取一次；页面隐藏时暂停，错误时退避。
 - 首次加载会先给 Notion 原生用量请求 1 秒响应时间；若其仍未完成，脚本立即用同源接口主动兜底，不再等待十几秒。
 - AI 请求结束后延迟刷新，并在当前页面内保留最后一次有效数据。
 - 点击「原生用量页」可打开 Notion 的 `Settings → Notion AI → Usage`。
@@ -38,7 +46,7 @@ Notion 官方目前把额度分成「滚动六小时窗口」和「月度窗口�
 2. 选择「添加扩展」，再从文件或 URL 导入 [notion-ai-usage.user.js](./notion-ai-usage.user.js)。
 3. 启用脚本后，完全刷新已打开的 Notion 页面。
 
-脚本使用 AdGuard 官方支持的 `@grant unsafeWindow` 进入页面上下文，并通过 `ADG_policyApi` 兼容 Trusted Types；同时保留 Violentmonkey 的 `@inject-into page`，防止其回退到无法观察 Notion 网络请求的隔离世界。`@inject-into` 只供 Violentmonkey 使用，AdGuard 的页面上下文由 `unsafeWindow` 提供，并不依赖该字段。同一份脚本可由 AdGuard 桌面版跨浏览器注入，也可直接安装到 Violentmonkey。页面右上角出现 `AI …% · …% | Trial …d`（中文界面显示中文）胶囊后即表示运行成功。
+脚本使用 AdGuard 官方支持的 `@grant unsafeWindow` 进入页面上下文，并通过 `ADG_policyApi` 兼容 Trusted Types；同时保留 Violentmonkey 的 `@inject-into page`，防止其回退到无法观察 Notion 网络请求的隔离世界。`@inject-into` 只供 Violentmonkey 使用，AdGuard 的页面上下文由 `unsafeWindow` 提供，并不依赖该字段。同一份脚本可由 AdGuard 桌面版跨浏览器注入，也可直接安装到 Violentmonkey。页面右上角出现 `AI …% · …% | Business · Active` 或 `AI …% · …% | Trial …d`（中文界面显示中文）胶囊后即表示运行成功。
 
 若 AdGuard 2.19+ 在导入时提示脚本会修改站点安全相关 API，这是因为本脚本需要在页面内观察 `fetch`/XHR 才能读取 Notion 自己返回的用量；请只安装你已检查过的本地文件。若脚本未出现，请确认 Notion 没有被加入 AdGuard 例外列表，并在启用扩展后完全刷新页面。
 
@@ -86,7 +94,7 @@ Content-Type: application/json
 
 百分比为 `clamp(used / limit * 100, 0, 100)`。月度窗口已经结束时不会继续显示旧数据。
 
-Business Trial 使用另一个只读 workspace 接口：
+套餐订阅与 Business Trial 使用另一个只读 workspace 接口：
 
 ```text
 POST /api/v3/getBillingData
@@ -95,7 +103,15 @@ Content-Type: application/json
 {"spaceId":"当前工作区 UUID"}
 ```
 
-响应中的实际日期路径为：
+正常订阅使用的最小字段为：
+
+```text
+billingData.subscription.status
+billingData.subscription.currentPeriodEnd
+billingData.subscription.items[].price.product
+```
+
+Business Trial 的实际日期路径为：
 
 ```text
 billingData.trial.startDate
@@ -107,7 +123,9 @@ billingData.subscription.startDate
 billingData.subscription.trialEnd
 ```
 
-日期是带时区的 ISO-8601 字符串。脚本还遵循 Notion 前端对 `billingData.clock` 的处理，并用其同款口径计算：从 billing 当前日期的零点到 trial end 的 UTC 天数差向上取整。两个 trial 表示同时出现、日期不合法、已经结束或实际活动套餐不是 Business 时，试用行会隐藏，不作猜测。
+日期是带时区的 ISO-8601 字符串。正常订阅会显示服务端明确返回的状态与当前周期结束时间；状态不在允许列表内时显示“状态未知”，不会猜成 Active。
+
+试用天数遵循 Notion 前端对 `billingData.clock` 的处理，并用其同款口径计算：从 billing 当前日期的零点到 trial end 的 UTC 天数差向上取整。独立 trial 只采用 `trial.items`，subscription-backed trial 只采用 `subscription.items`；两个 trial 表示同时出现或日期不合法时保留上一次有效状态。试用结束时会触发下一次账单刷新，随后回退到正常订阅状态。
 
 ## DevTools 验证
 
@@ -115,9 +133,9 @@ billingData.subscription.trialEnd
 
 1. 在 Arc 打开 Notion AI。
 2. 打开 DevTools → Network → Fetch/XHR。
-3. 过滤 `getCreditRateLimitStatus`。
+3. 过滤 `getCreditRateLimitStatus` 或 `getBillingData`。
 4. 点击脚本卡片中的「刷新」。
-5. 应看到同源 POST，Request Payload 只有 `spaceId`；Response 包含 `status`、`window`，并可能包含 `billingPeriodWindow`。
+5. 应看到同源 POST，Request Payload 只有 `spaceId`；用量响应包含 `status`、`window`，账单响应包含最小投影所需的 `subscription` 或 `trial` 字段。
 6. Console 不应出现脚本异常；接口 schema 改变时只会出现带 `[Notion AI Usage]` 前缀的警告，并继续保留最后有效快照。
 
 旧接口 `getAIUsageEligibility` 也可能出现，但不能把旧 eligibility 字段误当成新 Usage 页的两条进度。
@@ -128,8 +146,8 @@ billingData.subscription.trialEnd
 - 请求 URL 必须与当前 Notion 页面同源，且 pathname 必须精确匹配白名单。
 - 仅在内存中复用 `content-type`、Notion client version、active user、space id 等允许项。
 - 明确拒绝复制 `Cookie`、`Authorization` 和其他请求头。
-- 用量快照只保存在当前页面内存中，不写入 Web Storage；`localStorage` 只保存卡片展开/收起偏好。
-- `getBillingData` 还可能包含地址、支付方式与发票等账单字段；脚本设置 2 MB 上限，解析后立即只保留 trial 起止时间、服务端时钟和 `autoConvert`，其余字段与 `dependencies` 均不记录、不展示、不持久化。
+- 用量快照只保存在当前页面内存中，不写入 Web Storage；`localStorage` 只保存卡片展开/收起偏好与用户拖拽后的浮层位置。
+- `getBillingData` 还可能包含地址、支付方式与发票等账单字段；脚本设置 2 MB 上限，解析后立即只保留套餐、订阅状态、账单周期结束时间、trial 起止时间、服务端时钟和 `autoConvert`，其余字段与 `dependencies` 均不记录、不展示、不持久化。
 - 401/403 时停止主动取数并提示权限问题，不尝试绕过认证。
 
 ## 开发与测试
@@ -140,7 +158,7 @@ billingData.subscription.trialEnd
 npm run check
 ```
 
-该命令先做 JavaScript 语法检查，再运行单元测试，覆盖当前 quota schema、两种 Business Trial schema、Notion billing clock 天数算法、畸形与过期日期、同源白名单、请求头脱敏、跨账号与并发响应竞态，以及非目标请求正文绝不被读取。
+该命令先做 JavaScript 语法检查，再运行单元测试，覆盖当前 quota schema、正常与未知套餐订阅、两种 Business Trial schema、未知订阅状态、账单错误提示、Notion billing clock 天数算法、拖拽阈值与可视区域边界、位置存储校验、畸形与过期日期、同源白名单、请求头脱敏、跨账号与并发响应竞态，以及非目标请求正文绝不被读取。
 
 ## 研究说明
 
