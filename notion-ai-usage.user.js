@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         [Notion AI] Usage [20260731] v1.1.2
+// @name         [Notion AI] Usage [20260731] v1.1.3
 // @namespace    https://github.com/0-V-linuxdo/notion-ai-usage
-// @version      20260731.1.1.2
+// @version      20260731.1.1.3
 // @description  Show Notion AI usage and workspace plan status without exposing cookies or tokens.
 // @homepageURL  https://github.com/0-V-linuxdo/notion-ai-usage
 // @supportURL   https://github.com/0-V-linuxdo/notion-ai-usage/issues
@@ -32,6 +32,7 @@
   const POSITION_INSET = 8;
   const COMPOSER_DOCK_INSET = 7;
   const COMPOSER_SCAN_COOLDOWN_MS = 600;
+  const ORB_TOOLTIP_REQUIRED_SPACE = 64;
   const DRAG_THRESHOLD = 4;
   const MIN_REFRESH_INTERVAL = 15000;
   const BILLING_REFRESH_INTERVAL = 60 * 60 * 1000;
@@ -1500,6 +1501,16 @@
             { left: normalized.left, width: rect.width },
             viewport,
           );
+    if (ui.minimized) {
+      const orbHeight = ui.orb.getBoundingClientRect().height || rect.height;
+      const spaceAbove = normalized.top - POSITION_INSET;
+      const spaceBelow =
+        viewport.height - normalized.top - orbHeight - POSITION_INSET;
+      ui.host.dataset.tooltipSide =
+        spaceBelow >= ORB_TOOLTIP_REQUIRED_SPACE || spaceBelow >= spaceAbove
+          ? 'down'
+          : 'up';
+    }
     return normalized;
   }
 
@@ -2461,6 +2472,11 @@
     );
     const rollingText = presentation.rolling.text;
     const monthlyText = presentation.monthly.text;
+    ui.orbTooltipTitle.textContent = uiText('AI 用量', 'AI usage');
+    ui.orbTooltipDetail.textContent = uiText(
+      `6 小时 ${rollingText} · 月度 ${monthlyText}`,
+      `6h ${rollingText} · Monthly ${monthlyText}`,
+    );
     const label = presentation.status === 'not_applicable'
       ? uiText(
           'AI 用量：6 小时与月度均不适用，点击恢复',
@@ -2887,7 +2903,6 @@
           --usage-tooltip-border: rgba(255,255,255,.12);
           --usage-orb-track: rgba(255,255,255,.18);
           --usage-orb-core: #202124;
-          --usage-orb-value: #f7f7f5;
           --usage-shadow: 0 14px 42px rgba(0,0,0,.36);
           --usage-summary-item-gap: 11px;
           --usage-summary-separator-space: 12px;
@@ -2929,12 +2944,12 @@
           --usage-tooltip-border: rgba(15,15,15,.12);
           --usage-orb-track: rgba(15,15,15,.16);
           --usage-orb-core: #202124;
-          --usage-orb-value: #f7f7f5;
           --usage-shadow: 0 14px 38px rgba(15,15,15,.18);
         }
         * { box-sizing: border-box; }
         button { font: inherit; }
         .shell {
+          position: relative;
           display: flex;
           align-items: flex-end;
           flex-direction: column;
@@ -2947,9 +2962,9 @@
           pointer-events: auto;
           display: inline-flex;
           align-items: center;
-          gap: 5px;
+          gap: 4px;
           max-width: 100%;
-          min-height: 28px;
+          min-height: 24px;
           padding: 2px;
           border: 0;
           border-radius: 999px;
@@ -2958,24 +2973,23 @@
           cursor: pointer;
           touch-action: manipulation;
           user-select: none;
-          transition: transform .12s ease;
+          overflow: visible;
         }
-        .orb:hover { transform: translateY(-1px); }
         .orb[hidden], .summary[hidden] { display: none; }
         .orb-metric {
           display: block;
-          width: 24px;
-          height: 24px;
-          flex: 0 0 24px;
-          min-width: 24px;
+          width: 20px;
+          height: 20px;
+          flex: 0 0 20px;
+          min-width: 20px;
         }
         .orb-ring {
           --usage-orb-progress: 0;
           --usage-orb-color: #35b46f;
           display: block;
           position: relative;
-          width: 24px;
-          height: 24px;
+          width: 20px;
+          height: 20px;
           flex: 0 0 auto;
           border-radius: 50%;
           background: conic-gradient(
@@ -2983,12 +2997,12 @@
             var(--usage-orb-color) calc(var(--usage-orb-progress) * 1%),
             var(--usage-orb-track) 0
           );
-          box-shadow: 0 3px 10px rgba(0,0,0,.24);
+          box-shadow: 0 2px 7px rgba(0,0,0,.22);
         }
         .orb-ring::after {
           content: "";
           position: absolute;
-          inset: 3px;
+          inset: 2.5px;
           border-radius: inherit;
           background: var(--usage-orb-core);
         }
@@ -2997,23 +3011,55 @@
         .orb-ring[data-tone="waiting"] { --usage-orb-color: #8c8c8c; }
         .orb-ring[data-tone="neutral"] { --usage-orb-color: #8c8c8c; }
         .orb-value {
-          position: absolute;
-          z-index: 1;
-          inset: 0;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: var(--usage-orb-value);
-          font-size: 7px;
-          font-weight: 750;
-          font-variant-numeric: tabular-nums;
-          letter-spacing: -.05em;
-          opacity: 0;
-          white-space: nowrap;
-          transition: opacity .12s ease;
+          display: none;
         }
-        .orb:hover .orb-value,
-        .orb:focus-visible .orb-value { opacity: 1; }
+        .orb-tooltip {
+          pointer-events: none;
+          position: absolute;
+          z-index: 4;
+          top: calc(100% + 8px);
+          left: 50%;
+          width: max-content;
+          min-width: 166px;
+          max-width: min(260px, calc(100vw - 24px));
+          padding: 7px 9px 8px;
+          border: 1px solid rgba(255,255,255,.12);
+          border-radius: 8px;
+          color: #f7f7f5;
+          background: #2f2f2f;
+          box-shadow: 0 5px 18px rgba(0,0,0,.30);
+          text-align: left;
+          white-space: nowrap;
+          opacity: 0;
+          visibility: hidden;
+          transform: translate(-50%, -2px);
+          transition: opacity .12s ease, transform .12s ease, visibility .12s;
+        }
+        :host([data-tooltip-side="up"]) .orb-tooltip {
+          top: auto;
+          bottom: calc(100% + 8px);
+          transform: translate(-50%, 2px);
+        }
+        .orb-tooltip-title {
+          display: block;
+          font-size: 13px;
+          font-weight: 600;
+          line-height: 18px;
+        }
+        .orb-tooltip-detail {
+          display: block;
+          color: rgba(255,255,255,.64);
+          font-size: 12px;
+          font-weight: 450;
+          line-height: 17px;
+          font-variant-numeric: tabular-nums;
+        }
+        .shell[data-minimized="true"]:hover .orb-tooltip,
+        .orb:focus-visible + .orb-tooltip {
+          opacity: 1;
+          visibility: visible;
+          transform: translate(-50%, 0);
+        }
         .summary {
           pointer-events: auto;
           display: inline-flex;
@@ -3297,14 +3343,13 @@
         }
         @media (prefers-reduced-motion: reduce) {
           .bar-fill { transition: none; }
-          .orb { transition: none; }
-          .orb-value { transition: none; }
+          .orb-tooltip { transition: none; }
           .refresh.is-loading svg { animation: none; opacity: .55; }
           .preview-tooltip { transition: none; }
         }
       </style>
       <div class="shell">
-        <button class="orb" type="button" aria-label="AI usage" hidden>
+        <button class="orb" type="button" aria-label="AI usage" aria-describedby="notion-ai-usage-orb-tooltip" hidden>
           <span class="orb-metric" aria-hidden="true">
             <span class="orb-ring orb-rolling-ring"><span class="orb-value orb-rolling-value">…</span></span>
           </span>
@@ -3312,6 +3357,10 @@
             <span class="orb-ring orb-monthly-ring"><span class="orb-value orb-monthly-value">…</span></span>
           </span>
         </button>
+        <span class="orb-tooltip" id="notion-ai-usage-orb-tooltip" role="tooltip">
+          <span class="orb-tooltip-title">AI usage</span>
+          <span class="orb-tooltip-detail">6h … · Monthly …</span>
+        </span>
         <div class="summary">
           <button class="summary-toggle" type="button" aria-expanded="false" aria-controls="notion-ai-usage-card">
             <span class="dot" data-status="waiting" aria-hidden="true"></span>
@@ -3381,6 +3430,8 @@
       orbRollingValue: shadow.querySelector('.orb-rolling-value'),
       orbMonthlyRing: shadow.querySelector('.orb-monthly-ring'),
       orbMonthlyValue: shadow.querySelector('.orb-monthly-value'),
+      orbTooltipTitle: shadow.querySelector('.orb-tooltip-title'),
+      orbTooltipDetail: shadow.querySelector('.orb-tooltip-detail'),
       summary: shadow.querySelector('.summary'),
       summaryToggle: shadow.querySelector('.summary-toggle'),
       summaryText: shadow.querySelector('.summary-text'),

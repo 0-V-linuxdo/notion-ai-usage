@@ -189,8 +189,8 @@ function installFakePositionUi(harness, initial = { left: 1100, top: 16 }) {
     dataset: { side: 'right' },
     style: {},
     getBoundingClientRect() {
-      const width = ui && ui.minimized ? 57 : 300;
-      const height = ui && ui.minimized ? 28 : 38;
+      const width = ui && ui.minimized ? 48 : 300;
+      const height = ui && ui.minimized ? 24 : 38;
       const styledLeft = Number.parseFloat(host.style.left);
       const styledTop = Number.parseFloat(host.style.top);
       const left = Number.isFinite(styledLeft) ? styledLeft : initial.left;
@@ -213,7 +213,7 @@ function installFakePositionUi(harness, initial = { left: 1100, top: 16 }) {
     const rect = host.getBoundingClientRect();
     return { ...rect, width: 300, height: 38, right: rect.left + 300, bottom: rect.top + 38 };
   });
-  const orb = makeEventTarget(handleRect(57, 28));
+  const orb = makeEventTarget(handleRect(48, 24));
   const header = makeEventTarget(() => host.getBoundingClientRect());
   ui = {
     host,
@@ -259,9 +259,9 @@ function pointerEvent(overrides = {}) {
 
 test('uses AdGuard-compatible metadata and unsafeWindow realm constructors', () => {
   const source = fs.readFileSync(SCRIPT_PATH, 'utf8');
-  assert.match(source, /^\/\/ @name\s+\[Notion AI\] Usage \[20260731\] v1\.1\.2$/m);
+  assert.match(source, /^\/\/ @name\s+\[Notion AI\] Usage \[20260731\] v1\.1\.3$/m);
   assert.match(source, /^\/\/ @namespace\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage$/m);
-  assert.match(source, /^\/\/ @version\s+20260731\.1\.1\.2$/m);
+  assert.match(source, /^\/\/ @version\s+20260731\.1\.1\.3$/m);
   assert.match(source, /^\/\/ @homepageURL\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage$/m);
   assert.match(source, /^\/\/ @supportURL\s+https:\/\/github\.com\/0-V-linuxdo\/notion-ai-usage\/issues$/m);
   assert.match(source, /^\/\/ @downloadURL\s+https:\/\/raw\.githubusercontent\.com\/0-V-linuxdo\/notion-ai-usage\/main\/notion-ai-usage\.user\.js$/m);
@@ -309,8 +309,8 @@ test('uses AdGuard-compatible metadata and unsafeWindow realm constructors', () 
 test('keeps package and display release metadata aligned', () => {
   const packageJson = JSON.parse(fs.readFileSync(PACKAGE_PATH, 'utf8'));
   assert.equal(packageJson.name, 'notion-ai-usage');
-  assert.equal(packageJson.version, '1.1.2');
-  assert.equal(packageJson.releaseLabel, '[20260731] v1.1.2');
+  assert.equal(packageJson.version, '1.1.3');
+  assert.equal(packageJson.releaseLabel, '[20260731] v1.1.3');
   assert.equal(
     packageJson.repository.url,
     'git+https://github.com/0-V-linuxdo/notion-ai-usage.git',
@@ -540,7 +540,7 @@ test('remounts a minimized orb without rewriting its position or preference', ()
   first.hooks.setMinimized(storage.getItem(minimizedKey) === '1', false);
   first.hooks.restoreOverlayPosition();
   assert.equal(firstUi.minimized, true);
-  assert.equal(firstUi.host.style.left, '647px');
+  assert.equal(firstUi.host.style.left, '656px');
   assert.equal(storage.writes.length, 0);
 
   first.hooks.setMinimized(false);
@@ -557,7 +557,7 @@ test('remounts a minimized orb without rewriting its position or preference', ()
   remount.hooks.setMinimized(storage.getItem(minimizedKey) === '1', false);
   remount.hooks.restoreOverlayPosition();
   assert.equal(remountedUi.minimized, true);
-  assert.equal(remountedUi.host.style.left, '927px');
+  assert.equal(remountedUi.host.style.left, '936px');
   assert.equal(storage.writes.length, 0);
 });
 
@@ -653,21 +653,21 @@ test('centers the minimized circles inside the composer bottom without changing 
   assert.deepEqual(
     minimizedDockPosition(
       composer,
-      { width: 57, height: 28 },
+      { width: 48, height: 24 },
       { width: 1200, height: 800 },
     ),
-    { left: 591.5, top: 685 },
+    { left: 596, top: 689 },
   );
   assert.deepEqual(
     minimizedDockPosition(
       { left: -30, top: 750, right: 270, bottom: 830, width: 300, height: 80 },
-      { width: 57, height: 28 },
+      { width: 48, height: 24 },
       { width: 320, height: 800 },
     ),
-    { left: 91.5, top: 764 },
+    { left: 96, top: 768 },
   );
   assert.equal(
-    minimizedDockPosition(null, { width: 57, height: 28 }, { width: 1200, height: 800 }),
+    minimizedDockPosition(null, { width: 48, height: 24 }, { width: 1200, height: 800 }),
     null,
   );
 });
@@ -1112,6 +1112,8 @@ test('wires canonical position persistence, composer docking, dual circles, and 
   const orbRule = source.match(/\.orb \{([\s\S]*?)\n        \}/)?.[1] || '';
   const orbMetricRule = source.match(/\.orb-metric \{([\s\S]*?)\n        \}/)?.[1] || '';
   const orbRingRule = source.match(/\.orb-ring \{([\s\S]*?)\n        \}/)?.[1] || '';
+  const orbValueRule = source.match(/\.orb-value \{([\s\S]*?)\n        \}/)?.[1] || '';
+  const orbTooltipRule = source.match(/\.orb-tooltip \{([\s\S]*?)\n        \}/)?.[1] || '';
   const headerRule = source.match(/\.header \{([\s\S]*?)\n        \}/)?.[1] || '';
   assert.match(orbRule, /touch-action:\s*manipulation;/);
   assert.match(orbRule, /cursor:\s*pointer;/);
@@ -1124,20 +1126,32 @@ test('wires canonical position persistence, composer docking, dual circles, and 
   assert.doesNotMatch(source, /class="action icon-action minimize"/);
   assert.match(source, /ignoreSelector: '\.summary-minimize'/);
   assert.match(source, /runtime\.ui\.summary\.addEventListener\('click'/);
-  assert.match(orbRule, /min-height:\s*28px;/);
+  assert.match(orbRule, /gap:\s*4px;/);
+  assert.match(orbRule, /min-height:\s*24px;/);
   assert.match(orbRule, /padding:\s*2px;/);
-  assert.match(orbMetricRule, /width:\s*24px;/);
-  assert.match(orbMetricRule, /height:\s*24px;/);
-  assert.match(orbMetricRule, /flex:\s*0 0 24px;/);
+  assert.match(orbRule, /overflow:\s*visible;/);
+  assert.doesNotMatch(source, /\.orb:hover \{ transform:/);
+  assert.match(orbMetricRule, /width:\s*20px;/);
+  assert.match(orbMetricRule, /height:\s*20px;/);
+  assert.match(orbMetricRule, /flex:\s*0 0 20px;/);
   assert.match(orbRingRule, /display:\s*block;/);
-  assert.match(orbRingRule, /width:\s*24px;/);
-  assert.match(orbRingRule, /height:\s*24px;/);
-  assert.match(source, /font-size:\s*7px;/);
-  assert.match(source, /color:\s*var\(--usage-orb-value\);/);
-  assert.equal((source.match(/--usage-orb-value:\s*#f7f7f5;/g) || []).length, 2);
-  assert.match(source, /opacity:\s*0;/);
-  assert.match(source, /\.orb:hover \.orb-value,/);
-  assert.match(source, /\.orb:focus-visible \.orb-value \{ opacity: 1; \}/);
+  assert.match(orbRingRule, /width:\s*20px;/);
+  assert.match(orbRingRule, /height:\s*20px;/);
+  assert.match(orbValueRule, /display:\s*none;/);
+  assert.match(orbTooltipRule, /position:\s*absolute;/);
+  assert.match(orbTooltipRule, /min-width:\s*166px;/);
+  assert.match(orbTooltipRule, /background:\s*#2f2f2f;/);
+  assert.match(orbTooltipRule, /opacity:\s*0;/);
+  assert.match(source, /class="orb-tooltip" id="notion-ai-usage-orb-tooltip" role="tooltip"/);
+  assert.match(source, /class="orb-tooltip-title"/);
+  assert.match(source, /class="orb-tooltip-detail"/);
+  assert.match(source, /aria-describedby="notion-ai-usage-orb-tooltip"/);
+  assert.match(source, /\.shell\[data-minimized="true"\]:hover \.orb-tooltip,/);
+  assert.match(source, /\.orb:focus-visible \+ \.orb-tooltip/);
+  assert.match(source, /:host\(\[data-tooltip-side="up"\]\) \.orb-tooltip/);
+  assert.match(source, /ORB_TOOLTIP_REQUIRED_SPACE/);
+  assert.match(source, /`6h \$\{rollingText\} · Monthly \$\{monthlyText\}`/);
+  assert.doesNotMatch(source, /\.orb:hover \.orb-value/);
   assert.doesNotMatch(source, /ui\.orb\.title\s*=/);
   assert.match(summaryRule, /gap:\s*2px;/);
   assert.match(summaryRule, /min-height:\s*38px;/);
