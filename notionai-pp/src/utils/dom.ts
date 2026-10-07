@@ -34,7 +34,8 @@ export function visibleBox(el: Element | null | undefined): Box | null {
     if (!el || !el.isConnected) return null;
     if (el.closest("[aria-hidden='true'], [inert]")) return null;
     const style = getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) <= 0.02) return null;
+    const opacity = parseFloat(style.opacity);
+    if (style.display === "none" || style.visibility === "hidden" || opacity <= 0.02) return null;
     const box = boxOf(el);
     if (box.width <= 0 || box.height <= 0) return null;
     const vp = viewport();

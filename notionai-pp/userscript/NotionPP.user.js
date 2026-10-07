@@ -505,6 +505,130 @@
     };
   }
 
+  // src/plugins/autoCollapseThinking/index.ts
+  var TOGGLE = "[role='button'][aria-expanded][aria-controls]";
+  var STEP_TITLE = ".notion-agent-tool-use-title";
+  var STREAMING = "[role='status'], .nds-shimmer-text";
+  var THINKING_LABEL = /^(?:\d+\s*(?:steps?|个?步骤?)|thought|thinking|reasoning|已?思考|推理)/i;
+  var settings = definePluginSettings({
+    mode: {
+      type: "select",
+      label: "折叠时机 / When to collapse",
+      description: "回复完成后折叠，或生成过程中就折叠 / After the reply finishes, or while it is still streaming",
+      default: "finished",
+      options: [
+        { value: "finished", label: "回复完成后 / When the reply finishes" },
+        { value: "immediate", label: "立即（含生成中）/ Immediately, even while streaming" }
+      ]
+    },
+    collapseHistory: {
+      type: "boolean",
+      label: "折叠历史回复 / Collapse earlier replies",
+      description: "打开对话时，也折叠已经展开的旧回复思考 / Also collapse expanded thinking in replies already on the page",
+      default: true
+    }
+  });
+  var userOwned = new WeakSet;
+  var seenAtStart = new WeakSet;
+  var stopDom = null;
+  var attrObserver = null;
+  var scheduled2 = false;
+  function panelOf(toggle) {
+    const id = toggle.getAttribute("aria-controls");
+    return id ? toggle.ownerDocument.getElementById(id) : null;
+  }
+  function labelOf(toggle) {
+    return (toggle.textContent ?? "").replace(/\s+/g, " ").trim();
+  }
+  var isStreaming = (toggle) => !!toggle.querySelector(STREAMING);
+  function isThinkingToggle(toggle) {
+    if (!toggle.matches(TOGGLE))
+      return false;
+    if (toggle.closest(".notion-sidebar, nav"))
+      return false;
+    if (toggle.querySelector(STEP_TITLE))
+      return false;
+    if (isStreaming(toggle))
+      return true;
+    if (THINKING_LABEL.test(labelOf(toggle)))
+      return true;
+    const panel = panelOf(toggle);
+    return !!panel?.querySelector(STEP_TITLE);
+  }
+  function shouldCollapse(toggle) {
+    if (toggle.getAttribute("aria-expanded") !== "true")
+      return false;
+    if (userOwned.has(toggle))
+      return false;
+    if (!isThinkingToggle(toggle))
+      return false;
+    if (seenAtStart.has(toggle) && !settings.store.collapseHistory)
+      return false;
+    if (settings.store.mode !== "immediate" && isStreaming(toggle))
+      return false;
+    return true;
+  }
+  function scan(root = document) {
+    for (const toggle of root.querySelectorAll(TOGGLE)) {
+      if (shouldCollapse(toggle))
+        toggle.click();
+    }
+  }
+  function schedule() {
+    if (scheduled2)
+      return;
+    scheduled2 = true;
+    requestAnimationFrame(() => {
+      scheduled2 = false;
+      scan();
+    });
+  }
+  function claim(event) {
+    if (!event.isTrusted)
+      return;
+    if (event instanceof KeyboardEvent && event.key !== "Enter" && event.key !== " ")
+      return;
+    const toggle = event.target?.closest?.(TOGGLE);
+    if (toggle && isThinkingToggle(toggle))
+      userOwned.add(toggle);
+  }
+  var autoCollapseThinking_default = definePlugin({
+    name: "AutoCollapseThinking",
+    title: "自动折叠 AI 思考",
+    description: "Notion AI 回复完成后，自动折叠它的思考步骤（“N steps”）。手动展开过的不会再被折叠。",
+    enabledByDefault: true,
+    settings,
+    start() {
+      userOwned = new WeakSet;
+      seenAtStart = new WeakSet;
+      for (const toggle of document.querySelectorAll(TOGGLE)) {
+        if (!isStreaming(toggle))
+          seenAtStart.add(toggle);
+      }
+      document.addEventListener("click", claim, true);
+      document.addEventListener("keydown", claim, true);
+      stopDom = onDomChange(schedule);
+      attrObserver = new MutationObserver(schedule);
+      attrObserver.observe(document.documentElement, {
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["aria-expanded"]
+      });
+      scan();
+    },
+    stop() {
+      document.removeEventListener("click", claim, true);
+      document.removeEventListener("keydown", claim, true);
+      stopDom?.();
+      stopDom = null;
+      attrObserver?.disconnect();
+      attrObserver = null;
+    },
+    onSettingsChange() {
+      scan();
+    }
+  });
+
   // src/api/Theme.ts
   var DARK_RE = /(?:^|[\s_-])dark(?:$|[\s_-])/i;
   var LIGHT_RE = /(?:^|[\s_-])light(?:$|[\s_-])/i;
@@ -666,7 +790,8 @@
     if (el.closest("[aria-hidden='true'], [inert]"))
       return null;
     const style = getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) <= 0.02)
+    const opacity = parseFloat(style.opacity);
+    if (style.display === "none" || style.visibility === "hidden" || opacity <= 0.02)
       return null;
     const box = boxOf(el);
     if (box.width <= 0 || box.height <= 0)
@@ -775,7 +900,7 @@
   // src/plugins/navigator/messages.ts
   var USER_STEP = "data-agent-chat-user-step-id";
   var LEAF = "[data-content-editable-leaf]";
-  var TOGGLE = "[role='button'][aria-expanded]";
+  var TOGGLE2 = "[role='button'][aria-expanded]";
   var COPY_ASSISTANT = /\bcopy\s+(?:response|answer)\b|复制(?:回复|回答|响应)/i;
   var COPY_USER = /\bcopy\s+(?:text|message|prompt)\b|复制(?:文本|消息|提示词|问题)/i;
   var MONTHS = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December";
@@ -825,17 +950,17 @@
 `) : readText(step);
   }
   function assistantBody(turn) {
-    const toggles = turn.querySelectorAll(TOGGLE);
+    const toggles = turn.querySelectorAll(TOGGLE2);
     const column = toggles.length ? toggles[toggles.length - 1].parentElement?.parentElement : null;
     if (column && turn.contains(column)) {
-      const bodies = [...column.children].filter((child) => child instanceof HTMLElement && !child.querySelector(TOGGLE) && !child.matches(TOGGLE) && readText(child).length > 1);
+      const bodies = [...column.children].filter((child) => child instanceof HTMLElement && !child.querySelector(TOGGLE2) && !child.matches(TOGGLE2) && readText(child).length > 1);
       if (bodies.length)
         return bodies[bodies.length - 1];
     }
     return turn;
   }
   function regionsOf(turn) {
-    return [...turn.querySelectorAll(TOGGLE)].map((toggle) => toggle.getAttribute("aria-controls")).map((id) => id ? document.getElementById(id) : null).filter((node) => !!node && turn.contains(node));
+    return [...turn.querySelectorAll(TOGGLE2)].map((toggle) => toggle.getAttribute("aria-controls")).map((id) => id ? document.getElementById(id) : null).filter((node) => !!node && turn.contains(node));
   }
   function fromUserSteps(root) {
     const steps = [...root.querySelectorAll(`[${USER_STEP}]`)].filter((step) => !step.parentElement?.closest(`[${USER_STEP}]`));
@@ -979,7 +1104,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
   var ACTIVE_RATIO = 0.4;
   var SCROLL_OFFSET = 72;
   var SETTLE_MS = 150;
-  var settings = definePluginSettings({
+  var settings2 = definePluginSettings({
     showAssistant: { type: "boolean", label: "目录显示 AI 回复 / Show AI replies", default: true },
     effect: {
       type: "select",
@@ -995,7 +1120,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
   var cleanups = [];
   var q = (selector) => overlay.root.querySelector(selector);
   function visibleMessages(all) {
-    return settings.store.showAssistant ? all : all.filter((message) => message.role === "user");
+    return settings2.store.showAssistant ? all : all.filter((message) => message.role === "user");
   }
   function build() {
     if (!overlay)
@@ -1087,7 +1212,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
       clearTimeout(timer);
       timer = window.setTimeout(() => {
         (isRoot ? window : scroller).removeEventListener("scroll", settle);
-        playEffect(target, settings.store.effect);
+        playEffect(target, settings2.store.effect);
       }, SETTLE_MS);
     };
     (isRoot ? window : scroller).addEventListener("scroll", settle, { passive: true });
@@ -1099,7 +1224,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
     title: "对话目录 / Chat navigator",
     description: "在 Notion AI 对话右侧显示 Notion 风格目录，悬停展开，点击跳到对应提问或回复。",
     enabledByDefault: true,
-    settings,
+    settings: settings2,
     start() {
       overlay = createOverlay(NAV_HOST_ID, NAV_CSS, NAV_HTML);
       overlay.host.hidden = true;
@@ -2690,7 +2815,7 @@ svg.i { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-widt
       return;
     win[FLAG] = "[20261007] v1.0.0";
     installHooks();
-    registerPlugins([settings_default, usage_default, navigator_default]);
+    registerPlugins([settings_default, usage_default, navigator_default, autoCollapseThinking_default]);
     startPlugins("DocumentStart" /* DocumentStart */);
     const ready = () => startPlugins("DomReady" /* DomReady */);
     if (document.readyState === "loading")
