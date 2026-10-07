@@ -11,6 +11,7 @@ import { Logger } from "@utils/Logger";
 import { isTopmostNotionDocument, pageWindow } from "@utils/page";
 
 import autoCollapseThinking from "@plugins/autoCollapseThinking/index";
+import greetingCustomizer from "@plugins/greetingCustomizer/index";
 import chatNavigator from "@plugins/navigator/index";
 import settings from "@plugins/settings/index";
 import usageMeter from "@plugins/usage/index";
@@ -25,7 +26,7 @@ function boot() {
     if (win[FLAG] || !isTopmostNotionDocument()) return;
     win[FLAG] = typeof VERSION === "string" ? VERSION : true;
     installHooks();
-    registerPlugins([settings, usageMeter, chatNavigator, autoCollapseThinking]);
+    registerPlugins([settings, usageMeter, chatNavigator, autoCollapseThinking, greetingCustomizer]);
     startPlugins(StartAt.DocumentStart);
     const ready = () => startPlugins(StartAt.DomReady);
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", ready, { once: true });

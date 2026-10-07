@@ -389,6 +389,11 @@
         const value = getValue(owner, key);
         if (option.type === "boolean")
           return typeof value === "boolean" ? value : option.default;
+        if (option.type === "action")
+          return;
+        if (option.type === "number") {
+          return typeof value === "number" && Number.isFinite(value) ? Math.min(option.max, Math.max(option.min, Math.round(value))) : option.default;
+        }
         return typeof value === "string" && option.options.some((o) => o.value === value) ? value : option.default;
       },
       set: (_, key, value) => {
@@ -629,6 +634,140 @@
     }
   });
 
+  // src/api/Router.ts
+  var listeners3 = new Set;
+  var POLL_MS = 1000;
+  var last = "";
+  var installed2 = false;
+  function check() {
+    const href = pageWindow.location.href;
+    if (href === last)
+      return;
+    const change = { href, previous: last };
+    last = href;
+    for (const listener of [...listeners3]) {
+      try {
+        listener(change);
+      } catch {}
+    }
+  }
+  function install() {
+    if (installed2)
+      return;
+    installed2 = true;
+    last = pageWindow.location.href;
+    const schedule = () => queueMicrotask(check);
+    const nav = pageWindow.navigation;
+    if (nav && typeof nav.addEventListener === "function") {
+      nav.addEventListener("navigatesuccess", schedule);
+      nav.addEventListener("currententrychange", schedule);
+    }
+    for (const method of ["pushState", "replaceState"]) {
+      const native = pageWindow.history[method];
+      pageWindow.history[method] = function() {
+        const result = Reflect.apply(native, this, arguments);
+        schedule();
+        return result;
+      };
+    }
+    pageWindow.addEventListener("popstate", schedule);
+    pageWindow.addEventListener("hashchange", schedule);
+    setInterval(check, POLL_MS);
+  }
+  function onRouteChange(listener) {
+    install();
+    listeners3.add(listener);
+    return () => void listeners3.delete(listener);
+  }
+
+  // src/plugins/greetingCustomizer/store.ts
+  var PLUGIN = "GreetingCustomizer";
+  var MAX_LEN = 100;
+  var MAX_COUNT = 30;
+  var DEFAULT_GREETINGS = [
+    `Ask not what your country can do for you
+— ask what you can do for your country.`,
+    "It always seems impossible until it is done.",
+    "The best way to predict the future is to create it."
+  ];
+  var normalizeGreeting = (text) => text.replace(/\r\n?/g, `
+`).trim();
+  function validateGreeting(text) {
+    const value = normalizeGreeting(text);
+    if (!value)
+      return "empty";
+    if (value.length > MAX_LEN)
+      return "tooLong";
+    return null;
+  }
+  function loadGreetings() {
+    const raw = getValue(PLUGIN, "greetings");
+    const parsed = typeof raw === "string" ? safeJson(raw) : null;
+    const list = Array.isArray(parsed) ? parsed.filter((s) => typeof s === "string" && !!normalizeGreeting(s)).slice(0, MAX_COUNT) : [];
+    return list.length ? list : DEFAULT_GREETINGS.slice();
+  }
+  function saveGreetings(list) {
+    const clean = list.map(normalizeGreeting).filter(Boolean).slice(0, MAX_COUNT);
+    setValue(PLUGIN, "greetings", JSON.stringify(clean.length ? clean : DEFAULT_GREETINGS));
+  }
+  function loadIndex() {
+    const raw = getValue(PLUGIN, "index");
+    return typeof raw === "number" && Number.isInteger(raw) ? raw : -1;
+  }
+  var saveIndex = (index) => setValue(PLUGIN, "index", index);
+  function pickIndex(length, order, current, advance, random = Math.random) {
+    if (length <= 1)
+      return 0;
+    const valid = current >= 0 && current < length;
+    if (!advance)
+      return valid ? current : 0;
+    if (order === "random") {
+      let next = Math.floor(random() * length);
+      for (let guard = 0;valid && next === current && guard < 10; guard++)
+        next = Math.floor(random() * length);
+      if (valid && next === current)
+        next = (current + 1) % length;
+      return next;
+    }
+    return valid ? (current + 1) % length : 0;
+  }
+  var escapeCssContent = (text) => text.replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/\n/g, "\\a ");
+
+  // src/plugins/greetingCustomizer/lang.ts
+  var zh = /^zh\b/i.test((navigator.languages?.[0] ?? navigator.language) || "");
+  var STRINGS = {
+    title: ["问候语自定义 · 管理面板", "Greeting Customizer · Manager"],
+    close: ["关闭", "Close"],
+    newLabel: [`新问候语（支持换行，单条 ≤ ${MAX_LEN} 字符；最多 ${MAX_COUNT} 条）`, `New greeting (line breaks ok, max ${MAX_LEN} chars; up to ${MAX_COUNT} items)`],
+    placeholder: ["输入问候语…（可用换行）", "Type a greeting... (line breaks allowed)"],
+    add: ["添加", "Add"],
+    cancelEdit: ["取消修改", "Cancel edit"],
+    saveEdit: ["保存修改", "Save changes"],
+    saved: ["已保存：{count}/{max} 条", "Saved: {count}/{max}"],
+    edit: ["修改", "Edit"],
+    delete: ["删除", "Delete"],
+    empty: ["问候语不能为空（不能全是空格）。", "Greeting cannot be empty (whitespace only)."],
+    tooLong: [`单条问候语不能超过 ${MAX_LEN} 字符。`, `A greeting cannot exceed ${MAX_LEN} characters.`],
+    tooMany: [`最多只能保存 ${MAX_COUNT} 条问候语。`, `You can save up to ${MAX_COUNT} greetings.`],
+    rotation: ["轮播设置（自动保存）", "Rotation (saved automatically)"],
+    mode: ["轮播方式", "Mode"],
+    modeRefresh: ["刷新/进入首页时切换", "Rotate on refresh / entering home"],
+    modeInterval: ["按时间间隔自动切换", "Rotate on a timer"],
+    modeManual: ["手动点击标题切换", "Click the greeting to rotate"],
+    order: ["轮播顺序", "Order"],
+    orderSequential: ["顺序循环", "Sequential"],
+    orderRandom: ["随机选择", "Random"],
+    interval: ["间隔（秒）", "Interval (seconds)"],
+    tip: ["提示：手动模式下，点击首页问候语即可切换；定时模式离开首页会自动停止计时。双击右键问候语可随时打开本面板。", "Tip: in manual mode, click the home greeting to rotate. The timer stops when you leave the home page. Double right-click the greeting to open this panel."],
+    done: ["完成", "Done"],
+    clickHint: ["点击切换问候语", "Click to rotate greeting"],
+    menu: ["\uD83D\uDCAC NotionAI++ 问候语设置", "\uD83D\uDCAC NotionAI++ greetings"]
+  };
+  function tr(key, vars = {}) {
+    const text = STRINGS[key][zh ? 0 : 1];
+    return text.replace(/\{(\w+)\}/g, (match, name) => (name in vars) ? String(vars[name]) : match);
+  }
+
   // src/api/Theme.ts
   var DARK_RE = /(?:^|[\s_-])dark(?:$|[\s_-])/i;
   var LIGHT_RE = /(?:^|[\s_-])light(?:$|[\s_-])/i;
@@ -664,19 +803,19 @@
     }
     return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   }
-  var listeners3 = new Set;
+  var listeners4 = new Set;
   var observer2 = null;
-  var last = null;
+  var last2 = null;
   function notify() {
     const theme = currentTheme();
-    if (theme === last)
+    if (theme === last2)
       return;
-    last = theme;
-    for (const listener of [...listeners3])
+    last2 = theme;
+    for (const listener of [...listeners4])
       listener(theme);
   }
   function onThemeChange(listener) {
-    listeners3.add(listener);
+    listeners4.add(listener);
     if (!observer2) {
       observer2 = new MutationObserver(notify);
       const options = { attributes: true, subtree: false, attributeFilter: ["class", "data-theme", "data-mode", "lang"] };
@@ -688,11 +827,11 @@
         observer2.observe(inner, options);
       window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener?.("change", notify);
     }
-    last = null;
+    last2 = null;
     queueMicrotask(notify);
     return () => {
-      listeners3.delete(listener);
-      if (!listeners3.size) {
+      listeners4.delete(listener);
+      if (!listeners4.size) {
         observer2?.disconnect();
         observer2 = null;
       }
@@ -726,52 +865,6 @@
         host.remove();
       }
     };
-  }
-
-  // src/api/Router.ts
-  var listeners4 = new Set;
-  var POLL_MS = 1000;
-  var last2 = "";
-  var installed2 = false;
-  function check() {
-    const href = pageWindow.location.href;
-    if (href === last2)
-      return;
-    const change = { href, previous: last2 };
-    last2 = href;
-    for (const listener of [...listeners4]) {
-      try {
-        listener(change);
-      } catch {}
-    }
-  }
-  function install() {
-    if (installed2)
-      return;
-    installed2 = true;
-    last2 = pageWindow.location.href;
-    const schedule = () => queueMicrotask(check);
-    const nav = pageWindow.navigation;
-    if (nav && typeof nav.addEventListener === "function") {
-      nav.addEventListener("navigatesuccess", schedule);
-      nav.addEventListener("currententrychange", schedule);
-    }
-    for (const method of ["pushState", "replaceState"]) {
-      const native = pageWindow.history[method];
-      pageWindow.history[method] = function() {
-        const result = Reflect.apply(native, this, arguments);
-        schedule();
-        return result;
-      };
-    }
-    pageWindow.addEventListener("popstate", schedule);
-    pageWindow.addEventListener("hashchange", schedule);
-    setInterval(check, POLL_MS);
-  }
-  function onRouteChange(listener) {
-    install();
-    listeners4.add(listener);
-    return () => void listeners4.delete(listener);
   }
 
   // src/utils/dom.ts
@@ -810,6 +903,461 @@
     return document.scrollingElement ?? document.documentElement;
   }
   var reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+  function el(tag, props = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(props)) {
+      if (value === undefined)
+        continue;
+      if (key === "class")
+        node.className = value;
+      else if (key === "text")
+        node.textContent = value;
+      else
+        node.setAttribute(key, value);
+    }
+    node.append(...children);
+    return node;
+  }
+
+  // src/plugins/greetingCustomizer/manager.ts
+  var MANAGER_HOST_ID = "notionai-pp-greetings";
+  var CSS = `
+:host { all: initial; position: fixed; inset: 0; z-index: 2147483647; display: block;
+  --bg: #fff; --text: #37352f; --muted: #787774; --border: rgba(15,15,15,.1); --hover: rgba(15,15,15,.05); --accent: #2383e2; --danger: #eb5757;
+  font: 14px/1.45 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+:host([data-theme="dark"]) { --bg: #252525; --text: #ebebea; --muted: #9b9b9b; --border: rgba(255,255,255,.1); --hover: rgba(255,255,255,.06); }
+* { box-sizing: border-box; }
+.backdrop { position: absolute; inset: 0; background: rgba(15,15,15,.45); display: grid; place-items: center; padding: 16px; }
+.dialog { width: min(860px, 100%); max-height: min(84vh, 860px); display: flex; flex-direction: column; overflow: hidden;
+  border-radius: 12px; color: var(--text); background: var(--bg); box-shadow: 0 24px 60px rgba(0,0,0,.35); }
+header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+h2 { margin: 0; font-size: 16px; }
+.close { width: 28px; height: 28px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 18px; cursor: pointer; }
+.close:hover { background: var(--hover); color: var(--text); }
+.body { display: grid; grid-template-columns: 1.15fr .85fr; gap: 14px; padding: 14px 18px; overflow: auto; }
+@media (max-width: 760px) { .body { grid-template-columns: 1fr; } }
+.card { display: flex; flex-direction: column; gap: 8px; min-width: 0; border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.label { font-size: 12px; color: var(--muted); }
+textarea { width: 100%; min-height: 88px; resize: vertical; font: inherit; font-size: 13px; color: var(--text); background: transparent;
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none; }
+textarea:focus, select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(35,131,226,.18); outline: none; }
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.row.split { justify-content: space-between; }
+.counter { margin-left: auto; font-size: 12px; color: var(--muted); }
+.error { color: var(--danger); font-size: 12.5px; }
+.hint { color: var(--muted); font-size: 12.5px; }
+button.btn { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+button.btn:hover { background: var(--hover); }
+button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+button.primary:hover { background: #0b6fcc; }
+ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+li { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+li[data-current] { border-color: var(--accent); }
+li[data-editing] { background: var(--hover); }
+.text { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; font-size: 13px; }
+.icon { width: 26px; height: 26px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; font-size: 13px; }
+.icon:hover { background: var(--hover); }
+label.field { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+select, input[type=number] { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+input[type=number] { width: 80px; }
+input:disabled { opacity: .5; }
+footer { display: flex; justify-content: flex-end; padding: 12px 18px; border-top: 1px solid var(--border); }
+:focus-visible { outline: 2px solid #4e9cff; outline-offset: 2px; }
+`;
+  var overlay = null;
+  function closeManager() {
+    overlay?.destroy();
+    overlay = null;
+  }
+  function openManager(rotation, currentIndex) {
+    closeManager();
+    overlay = createOverlay(MANAGER_HOST_ID, CSS, `<div class="backdrop"><div class="dialog" role="dialog" aria-modal="true"></div></div>`);
+    const { root } = overlay;
+    const dialog = root.querySelector(".dialog");
+    root.querySelector(".backdrop").addEventListener("click", (event) => event.target === event.currentTarget && closeManager());
+    root.addEventListener("keydown", (event) => event.key === "Escape" && closeManager());
+    let greetings = loadGreetings();
+    let editing = -1;
+    const close = el("button", { class: "close", type: "button", "aria-label": tr("close"), title: tr("close"), text: "×" });
+    close.addEventListener("click", closeManager);
+    const header = el("header", {}, el("h2", { text: tr("title") }), close);
+    const textarea = el("textarea", { placeholder: tr("placeholder"), maxlength: String(MAX_LEN) });
+    textarea.setAttribute("aria-label", tr("placeholder"));
+    const error = el("div", { class: "error", role: "alert" });
+    const submit = el("button", { class: "btn primary", type: "button", text: tr("add") });
+    const cancel = el("button", { class: "btn", type: "button", text: tr("cancelEdit") });
+    const counter = el("span", { class: "counter" });
+    const saved = el("div", { class: "hint" });
+    const list = el("ul");
+    const left = el("div", { class: "card" }, el("div", { class: "label", text: tr("newLabel") }), textarea, error, el("div", { class: "row" }, submit, cancel, counter), saved, list);
+    const setError = (key) => {
+      error.textContent = key ? tr(key) : "";
+      error.hidden = !key;
+    };
+    const syncCounter = () => void (counter.textContent = `${textarea.value.length}/${MAX_LEN}`);
+    const stopEditing = () => {
+      editing = -1;
+      textarea.value = "";
+      submit.textContent = tr("add");
+      cancel.hidden = true;
+      syncCounter();
+    };
+    function persist() {
+      saveGreetings(greetings);
+      greetings = loadGreetings();
+    }
+    function render() {
+      saved.textContent = tr("saved", { count: greetings.length, max: MAX_COUNT });
+      const current = currentIndex();
+      list.replaceChildren(...greetings.map((greeting, index) => {
+        const edit = el("button", { class: "icon", type: "button", title: tr("edit"), "aria-label": tr("edit"), text: "✍️" });
+        const remove = el("button", { class: "icon", type: "button", title: tr("delete"), "aria-label": tr("delete"), text: "\uD83D\uDDD1️" });
+        edit.addEventListener("click", () => {
+          editing = index;
+          textarea.value = greetings[index];
+          submit.textContent = tr("saveEdit");
+          cancel.hidden = false;
+          setError(null);
+          syncCounter();
+          render();
+          textarea.focus();
+        });
+        remove.addEventListener("click", () => {
+          greetings.splice(index, 1);
+          if (editing === index)
+            stopEditing();
+          else if (editing > index)
+            editing--;
+          persist();
+          render();
+        });
+        const item = el("li", {}, el("div", { class: "text", text: greeting }), edit, remove);
+        item.toggleAttribute("data-current", index === current);
+        item.toggleAttribute("data-editing", index === editing);
+        return item;
+      }));
+    }
+    submit.addEventListener("click", () => {
+      const problem = validateGreeting(textarea.value);
+      if (problem)
+        return setError(problem);
+      if (editing < 0 && greetings.length >= MAX_COUNT)
+        return setError("tooMany");
+      const text = normalizeGreeting(textarea.value);
+      if (editing >= 0)
+        greetings[editing] = text;
+      else
+        greetings.push(text);
+      setError(null);
+      stopEditing();
+      persist();
+      render();
+    });
+    cancel.addEventListener("click", () => {
+      stopEditing();
+      setError(null);
+      render();
+    });
+    textarea.addEventListener("input", syncCounter);
+    textarea.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey))
+        submit.click();
+    });
+    const values = rotation.get();
+    const select = (key, options) => {
+      const node = el("select");
+      for (const [value, label] of options)
+        node.append(el("option", { value, text: tr(label) }));
+      node.value = values[key];
+      node.addEventListener("change", () => {
+        rotation.set(key, node.value);
+        syncInterval();
+      });
+      return node;
+    };
+    const mode = select("mode", [["refresh", "modeRefresh"], ["interval", "modeInterval"], ["manual", "modeManual"]]);
+    const order = select("order", [["sequential", "orderSequential"], ["random", "orderRandom"]]);
+    const interval = el("input", { type: "number", min: "1", max: "3600", step: "1", value: String(values.intervalSec) });
+    interval.addEventListener("change", () => {
+      const value = Math.min(3600, Math.max(1, Math.round(Number(interval.value) || values.intervalSec)));
+      interval.value = String(value);
+      rotation.set("intervalSec", value);
+    });
+    const syncInterval = () => void (interval.disabled = mode.value !== "interval");
+    const field = (label, control) => el("label", { class: "field" }, el("span", { text: tr(label) }), control);
+    const right = el("div", { class: "card" }, el("div", { class: "label", text: tr("rotation") }), field("mode", mode), field("order", order), field("interval", interval), el("div", { class: "hint", text: tr("tip") }));
+    const done = el("button", { class: "btn primary", type: "button", text: tr("done") });
+    done.addEventListener("click", closeManager);
+    dialog.append(header, el("div", { class: "body" }, left, right), el("footer", {}, done));
+    stopEditing();
+    setError(null);
+    syncInterval();
+    render();
+    textarea.focus();
+  }
+
+  // src/plugins/greetingCustomizer/target.ts
+  var TARGET_ATTR = "data-npp-greeting";
+  var TARGET_SELECTOR = `[${TARGET_ATTR}="1"]`;
+  var ORIGINAL_GREETING = "How can I help you today?";
+  var FACE = "img[alt='Notion AI face'], [role='img'][aria-label='Notion AI face']";
+  var CONTROL = "button, [role='button']";
+  var INTERACTIVE = "button, a, input, textarea, select, [contenteditable='true'], [role='button'], [role='textbox']";
+  var MAX_DEPTH = 6;
+  var isHomePath = (pathname = location.pathname) => /^\/ai\/?$/.test(pathname);
+  var normalize = (text) => String(text ?? "").replace(/\s+/g, " ").trim();
+  function textSibling(container, branch) {
+    const children = [...container.children];
+    const at = children.indexOf(branch);
+    const candidates = children.filter((child) => child !== branch && normalize(child.textContent) && !child.matches(INTERACTIVE) && !child.querySelector(INTERACTIVE));
+    return candidates.find((child) => children.indexOf(child) > at) ?? candidates[0] ?? null;
+  }
+  function fromFace(scope) {
+    for (const face of scope.querySelectorAll(FACE)) {
+      const control = face.closest(CONTROL);
+      if (!control)
+        continue;
+      let container = control.parentElement;
+      for (let depth = 0;container && depth < MAX_DEPTH; depth++) {
+        if (container !== scope && !scope.contains(container))
+          break;
+        const branch = [...container.children].find((child) => child === control || child.contains(control));
+        const target = branch && textSibling(container, branch);
+        if (target)
+          return target;
+        if (container === scope)
+          break;
+        container = container.parentElement;
+      }
+    }
+    return null;
+  }
+  function fromOriginalText(scope) {
+    const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode();node; node = walker.nextNode()) {
+      if (normalize(node.nodeValue) !== ORIGINAL_GREETING)
+        continue;
+      let target = node.parentElement;
+      while (target?.parentElement && target !== scope) {
+        const parent = target.parentElement;
+        if (normalize(parent.textContent) !== ORIGINAL_GREETING || parent.querySelector("button"))
+          break;
+        target = parent;
+      }
+      return target;
+    }
+    return null;
+  }
+  function findGreeting(scope = document.body) {
+    if (!scope)
+      return null;
+    return fromFace(scope) ?? fromOriginalText(scope);
+  }
+  function clearMarks(except = null) {
+    for (const el of document.querySelectorAll(TARGET_SELECTOR)) {
+      if (el !== except)
+        el.removeAttribute(TARGET_ATTR);
+    }
+  }
+  function syncMark() {
+    if (!isHomePath()) {
+      clearMarks();
+      return null;
+    }
+    const target = findGreeting();
+    clearMarks(target);
+    if (target && target.getAttribute(TARGET_ATTR) !== "1")
+      target.setAttribute(TARGET_ATTR, "1");
+    return target;
+  }
+
+  // src/plugins/greetingCustomizer/index.ts
+  var STYLE_ID = "notionai-pp-greeting-style";
+  var RIGHT_DOUBLE_MS = 400;
+  var settings2 = definePluginSettings({
+    manage: {
+      type: "action",
+      label: "问候语列表 / Greetings",
+      description: "添加、修改、删除问候语；也可在首页双击右键问候语打开 / Add, edit or delete greetings; double right-click the home greeting also opens it",
+      button: "管理… / Manage…",
+      run: () => openGreetingManager()
+    },
+    mode: {
+      type: "select",
+      label: "轮播方式 / Rotation",
+      default: "refresh",
+      options: [
+        { value: "refresh", label: "刷新/进入首页时切换 / On refresh or entering home" },
+        { value: "interval", label: "按时间间隔切换 / On a timer" },
+        { value: "manual", label: "点击问候语切换 / Click the greeting" }
+      ]
+    },
+    order: {
+      type: "select",
+      label: "轮播顺序 / Order",
+      default: "sequential",
+      options: [
+        { value: "sequential", label: "顺序循环 / Sequential" },
+        { value: "random", label: "随机 / Random" }
+      ]
+    },
+    intervalSec: {
+      type: "number",
+      label: "切换间隔（秒）/ Interval (seconds)",
+      description: "仅“按时间间隔切换”时生效 / Only used by the timer mode",
+      default: 10,
+      min: 1,
+      max: 3600
+    }
+  });
+  var stopDom2 = null;
+  var stopRoute = null;
+  var timer = null;
+  var wasHome = false;
+  var lastRightClick = 0;
+  var menuRegistered = false;
+  var running = false;
+  function upsertStyle(css) {
+    let style = document.getElementById(STYLE_ID);
+    if (style?.textContent === css)
+      return;
+    if (!style) {
+      style = document.createElement("style");
+      style.id = STYLE_ID;
+      (document.head ?? document.documentElement).append(style);
+    }
+    style.textContent = css;
+  }
+  function buildCss(text, clickable) {
+    const sel = TARGET_SELECTOR;
+    return `
+${sel} { font-size: 0 !important; line-height: 0 !important; text-align: center !important; }
+${sel} > * { display: none !important; }
+${sel}::after { content: "${escapeCssContent(text)}"; display: block !important; visibility: visible !important;
+  font-size: 1.5rem !important; line-height: 1.35 !important; font-weight: 600 !important; color: currentColor !important;
+  white-space: pre-wrap !important; text-align: center !important; width: 100% !important; margin: 0 auto !important; padding: 0 !important; }
+${clickable ? `${sel} { cursor: pointer !important; user-select: none !important; }` : ""}
+@media (max-width: 768px) { ${sel}::after { font-size: 1.25rem !important; line-height: 1.3 !important; } }
+`;
+  }
+  function apply(advance = false) {
+    const greetings = loadGreetings();
+    const current = loadIndex();
+    const index = pickIndex(greetings.length, settings2.store.order, current, advance);
+    if (index !== current)
+      saveIndex(index);
+    const clickable = settings2.store.mode === "manual" && greetings.length > 1;
+    upsertStyle(buildCss(greetings[index] ?? greetings[0], clickable));
+    syncTitle();
+  }
+  function syncTitle() {
+    const target = document.querySelector(TARGET_SELECTOR);
+    if (!target)
+      return;
+    const want = settings2.store.mode === "manual" && loadGreetings().length > 1 ? tr("clickHint") : null;
+    if (want)
+      target.title = want;
+    else
+      target.removeAttribute("title");
+  }
+  function syncTimer() {
+    const want = running && settings2.store.mode === "interval" && isHomePath() && loadGreetings().length > 1;
+    if (!want) {
+      if (timer)
+        clearInterval(timer);
+      timer = null;
+      return;
+    }
+    if (timer)
+      return;
+    timer = setInterval(() => apply(true), settings2.store.intervalSec * 1000);
+  }
+  function restartTimer() {
+    if (timer)
+      clearInterval(timer);
+    timer = null;
+    syncTimer();
+  }
+  function check2() {
+    const home = isHomePath();
+    const marked = syncMark();
+    if (home && !wasHome)
+      apply(settings2.store.mode === "refresh");
+    else if (marked)
+      syncTitle();
+    wasHome = home;
+    syncTimer();
+  }
+  var targetOf = (event) => event.target?.closest?.(TARGET_SELECTOR) ?? null;
+  function onClick(event) {
+    if (event.button !== 0 || !targetOf(event))
+      return;
+    if (settings2.store.mode !== "manual" || loadGreetings().length <= 1)
+      return;
+    if (String(window.getSelection?.() ?? "").trim())
+      return;
+    apply(true);
+  }
+  function onContextMenu(event) {
+    if (!targetOf(event))
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    const now = Date.now();
+    if (now - lastRightClick <= RIGHT_DOUBLE_MS) {
+      lastRightClick = 0;
+      openGreetingManager();
+    } else {
+      lastRightClick = now;
+    }
+  }
+  function openGreetingManager() {
+    openManager({
+      get: () => ({ mode: settings2.store.mode, order: settings2.store.order, intervalSec: settings2.store.intervalSec }),
+      set: (key, value) => void (settings2.store[key] = value)
+    }, loadIndex);
+  }
+  var greetingCustomizer_default = definePlugin({
+    name: "GreetingCustomizer",
+    title: "自定义问候语",
+    description: "把 Notion AI 首页的问候语换成你自己的文案：多条管理，顺序或随机轮播，刷新、定时或点击切换。在首页双击右键问候语可打开管理面板。",
+    enabledByDefault: true,
+    settings: settings2,
+    start() {
+      running = true;
+      wasHome = false;
+      lastRightClick = 0;
+      document.addEventListener("click", onClick, true);
+      document.addEventListener("contextmenu", onContextMenu, true);
+      stopDom2 = onDomChange(check2);
+      stopRoute = onRouteChange(check2);
+      if (!menuRegistered && typeof GM_registerMenuCommand === "function") {
+        menuRegistered = true;
+        try {
+          GM_registerMenuCommand(tr("menu"), () => openGreetingManager());
+        } catch {}
+      }
+      check2();
+    },
+    stop() {
+      running = false;
+      document.removeEventListener("click", onClick, true);
+      document.removeEventListener("contextmenu", onContextMenu, true);
+      stopDom2?.();
+      stopRoute?.();
+      stopDom2 = stopRoute = null;
+      syncTimer();
+      clearMarks();
+      document.getElementById(STYLE_ID)?.remove();
+      closeManager();
+    },
+    onSettingsChange(key) {
+      if (key === "index")
+        return apply(false);
+      apply(false);
+      restartTimer();
+    }
+  });
 
   // src/utils/time.ts
   function debounce(fn, wait, maxWait = Infinity) {
@@ -853,7 +1401,7 @@
     { value: "jiggle", zh: "水平抖动", en: "Jiggle" },
     { value: "none", zh: "无（仅滚动）", en: "None (scroll only)" }
   ];
-  var running = new WeakMap;
+  var running2 = new WeakMap;
   var KEYFRAMES = {
     border: {
       frames: [
@@ -887,14 +1435,14 @@
   function playEffect(element, effect) {
     if (effect === "none" || typeof element.animate !== "function")
       return;
-    running.get(element)?.cancel();
+    running2.get(element)?.cancel();
     const { frames, duration } = KEYFRAMES[effect];
     const reduced = reducedMotion();
     const animation = element.animate(effect === "jiggle" && reduced ? KEYFRAMES.fade.frames : frames, {
       duration: reduced ? Math.min(duration, 1000) : duration,
       easing: "ease-in-out"
     });
-    running.set(element, animation);
+    running2.set(element, animation);
   }
 
   // src/plugins/navigator/messages.ts
@@ -1104,7 +1652,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
   var ACTIVE_RATIO = 0.4;
   var SCROLL_OFFSET = 72;
   var SETTLE_MS = 150;
-  var settings2 = definePluginSettings({
+  var settings3 = definePluginSettings({
     showAssistant: { type: "boolean", label: "目录显示 AI 回复 / Show AI replies", default: true },
     effect: {
       type: "select",
@@ -1113,23 +1661,23 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
       options: EFFECTS.map((effect) => ({ value: effect.value, label: `${effect.zh} / ${effect.en}` }))
     }
   });
-  var overlay = null;
+  var overlay2 = null;
   var messages = [];
   var signature = "";
   var activeId = "";
   var cleanups = [];
-  var q = (selector) => overlay.root.querySelector(selector);
+  var q = (selector) => overlay2.root.querySelector(selector);
   function visibleMessages(all) {
-    return settings2.store.showAssistant ? all : all.filter((message) => message.role === "user");
+    return settings3.store.showAssistant ? all : all.filter((message) => message.role === "user");
   }
   function build() {
-    if (!overlay)
+    if (!overlay2)
       return;
     const next = isAiRoute() ? visibleMessages(collectMessages()) : [];
     const nextSignature = next.map((m) => `${m.id}\x01${summarize(m.text)}`).join("\x02");
     const sameElements = next.length === messages.length && next.every((m, i) => m.element === messages[i].element);
     messages = next;
-    overlay.host.hidden = !next.length;
+    overlay2.host.hidden = !next.length;
     if (nextSignature === signature) {
       if (!sameElements)
         updateActive();
@@ -1167,10 +1715,10 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
     updateActive();
   }
   function setActive(id) {
-    if (!overlay || id === activeId)
+    if (!overlay2 || id === activeId)
       return;
     activeId = id;
-    for (const node of overlay.root.querySelectorAll("[data-id]"))
+    for (const node of overlay2.root.querySelectorAll("[data-id]"))
       node.classList.toggle("active", node.dataset.id === id);
     const lines = q(".lines");
     const rail = q(".rail");
@@ -1180,7 +1728,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
     const overflow = lines.scrollHeight - rail.clientHeight;
     const offset = overflow > 0 ? Math.min(overflow, Math.max(0, line.offsetTop - rail.clientHeight / 2)) : 0;
     lines.style.transform = `translateY(${-offset}px)`;
-    const item = overlay.root.querySelector(`button.item.active`);
+    const item = overlay2.root.querySelector(`button.item.active`);
     item?.scrollIntoView({ block: "nearest" });
   }
   function updateActive() {
@@ -1212,7 +1760,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
       clearTimeout(timer);
       timer = window.setTimeout(() => {
         (isRoot ? window : scroller).removeEventListener("scroll", settle);
-        playEffect(target, settings2.store.effect);
+        playEffect(target, settings3.store.effect);
       }, SETTLE_MS);
     };
     (isRoot ? window : scroller).addEventListener("scroll", settle, { passive: true });
@@ -1224,10 +1772,10 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
     title: "对话目录 / Chat navigator",
     description: "在 Notion AI 对话右侧显示 Notion 风格目录，悬停展开，点击跳到对应提问或回复。",
     enabledByDefault: true,
-    settings: settings2,
+    settings: settings3,
     start() {
-      overlay = createOverlay(NAV_HOST_ID, NAV_CSS, NAV_HTML);
-      overlay.host.hidden = true;
+      overlay2 = createOverlay(NAV_HOST_ID, NAV_CSS, NAV_HTML);
+      overlay2.host.hidden = true;
       const rescan = debounce(build, RESCAN_MS, RESCAN_MAX_MS);
       const onScroll = frameThrottle(updateActive);
       window.addEventListener("scroll", onScroll, { capture: true, passive: true });
@@ -1247,8 +1795,8 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
     stop() {
       for (const cleanup of cleanups.splice(0))
         cleanup();
-      overlay?.destroy();
-      overlay = null;
+      overlay2?.destroy();
+      overlay2 = null;
       messages = [];
       signature = "";
       activeId = "";
@@ -1274,7 +1822,7 @@ button.item[data-role="assistant"] { padding-left: 22px; font-size: 12.5px; }
 
   // src/plugins/settings/index.ts
   var SETTINGS_HOST_ID = "notionai-pp-settings";
-  var CSS = `
+  var CSS2 = `
 :host { all: initial; position: fixed; inset: 0; z-index: 2147483647; display: block;
   --bg: #fff; --text: #37352f; --muted: #787774; --border: rgba(15,15,15,.1); --hover: rgba(15,15,15,.05); --accent: #2383e2;
   font: 14px/1.45 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -1295,6 +1843,9 @@ section:last-child { border-bottom: 0; }
 .options { margin-top: 10px; display: grid; gap: 8px; padding-left: 2px; }
 .options[data-off] { opacity: .45; pointer-events: none; }
 label.opt { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
+input.num { width: 72px; font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+button.act { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+button.act:hover { background: var(--hover); }
 select { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
 .switch { position: relative; width: 32px; height: 18px; flex: 0 0 auto; appearance: none; margin: 0; border-radius: 99px;
   background: rgba(135,131,120,.3); cursor: pointer; transition: background .15s; }
@@ -1302,7 +1853,7 @@ select { font: inherit; font-size: 13px; color: var(--text); background: var(--b
 .switch:checked { background: var(--accent); } .switch:checked::after { transform: translateX(14px); }
 :focus-visible { outline: 2px solid #4e9cff; outline-offset: 2px; }
 `;
-  var overlay2 = null;
+  var overlay3 = null;
   var cleanups2 = [];
   function switchInput(checked, label, onChange) {
     const input = document.createElement("input");
@@ -1314,13 +1865,13 @@ select { font: inherit; font-size: 13px; color: var(--text); background: var(--b
     return input;
   }
   function close() {
-    overlay2?.destroy();
-    overlay2 = null;
+    overlay3?.destroy();
+    overlay3 = null;
   }
   function openSettings() {
     close();
-    overlay2 = createOverlay(SETTINGS_HOST_ID, CSS, `<div class="backdrop"><div class="dialog" role="dialog" aria-modal="true"><header><h2>NotionAI++<small></small></h2><button class="close" type="button">×</button></header><div class="body"></div></div></div>`);
-    const { root } = overlay2;
+    overlay3 = createOverlay(SETTINGS_HOST_ID, CSS2, `<div class="backdrop"><div class="dialog" role="dialog" aria-modal="true"><header><h2>NotionAI++<small></small></h2><button class="close" type="button">×</button></header><div class="body"></div></div></div>`);
+    const { root } = overlay3;
     root.querySelector("small").textContent = "[20261007] v1.0.0";
     const closeButton = root.querySelector(".close");
     closeButton.setAttribute("aria-label", t("关闭", "Close"));
@@ -1357,6 +1908,30 @@ select { font: inherit; font-size: 13px; color: var(--text); background: var(--b
         label.append(span);
         if (def.type === "boolean") {
           label.append(switchInput(Boolean(store[key]), def.label, (value) => setValue(plugin.name, key, value)));
+        } else if (def.type === "number") {
+          const input = document.createElement("input");
+          input.type = "number";
+          input.className = "num";
+          input.min = String(def.min);
+          input.max = String(def.max);
+          input.step = "1";
+          input.value = String(store[key]);
+          input.addEventListener("change", () => {
+            const value = Math.min(def.max, Math.max(def.min, Math.round(Number(input.value) || def.default)));
+            input.value = String(value);
+            setValue(plugin.name, key, value);
+          });
+          label.append(input);
+        } else if (def.type === "action") {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "act";
+          button.textContent = def.button;
+          button.addEventListener("click", (event) => {
+            event.preventDefault();
+            def.run();
+          });
+          label.append(button);
         } else {
           const select = document.createElement("select");
           for (const option of def.options)
@@ -1587,7 +2162,7 @@ select { font: inherit; font-size: 13px; color: var(--text); background: var(--b
   // src/plugins/usage/verdict.ts
   var STATUSES2 = new Set(["within_limit", "rate_limited", "not_applicable"]);
   var PRIORITY_KEYS = ["creditRateLimitVerdict", "creditRateLimitStatus", "data", "result", "value"];
-  var MAX_DEPTH = 6;
+  var MAX_DEPTH2 = 6;
   var MAX_NODES = 240;
   function percentage(used, limit) {
     return limit > 0 && Number.isFinite(used) ? clamp(used / limit * 100, 0, 100) : 0;
@@ -1606,7 +2181,7 @@ select { font: inherit; font-size: 13px; color: var(--text); background: var(--b
       const { value, depth } = queue.shift();
       if (isVerdict(value))
         return value;
-      if (depth >= MAX_DEPTH || typeof value !== "object" || value === null || seen.has(value))
+      if (depth >= MAX_DEPTH2 || typeof value !== "object" || value === null || seen.has(value))
         continue;
       seen.add(value);
       const record = value;
@@ -2815,7 +3390,7 @@ svg.i { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-widt
       return;
     win[FLAG] = "[20261007] v1.0.0";
     installHooks();
-    registerPlugins([settings_default, usage_default, navigator_default, autoCollapseThinking_default]);
+    registerPlugins([settings_default, usage_default, navigator_default, autoCollapseThinking_default, greetingCustomizer_default]);
     startPlugins("DocumentStart" /* DocumentStart */);
     const ready = () => startPlugins("DomReady" /* DomReady */);
     if (document.readyState === "loading")

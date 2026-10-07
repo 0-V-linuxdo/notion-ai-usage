@@ -28,12 +28,30 @@ export interface SelectOption {
     options: { value: string; label: string }[];
 }
 
-export type OptionDef = BooleanOption | SelectOption;
+export interface NumberOption {
+    type: "number";
+    label: string;
+    description?: string;
+    default: number;
+    min: number;
+    max: number;
+}
+
+/** A button in the settings dialog; it stores nothing. */
+export interface ActionOption {
+    type: "action";
+    label: string;
+    description?: string;
+    button: string;
+    run(): void;
+}
+
+export type OptionDef = BooleanOption | SelectOption | NumberOption | ActionOption;
 
 export type OptionsDef = Record<string, OptionDef>;
 
 export type OptionValues<D extends OptionsDef> = {
-    [K in keyof D]: D[K] extends BooleanOption ? boolean : string;
+    [K in keyof D]: D[K] extends BooleanOption ? boolean : D[K] extends NumberOption ? number : D[K] extends ActionOption ? undefined : string;
 };
 
 type Bag = Record<string, Record<string, OptionValue>>;
@@ -103,6 +121,12 @@ export function definePluginSettings<D extends OptionsDef>(def: D): PluginSettin
             if (!option) return undefined;
             const value = getValue(owner, key);
             if (option.type === "boolean") return typeof value === "boolean" ? value : option.default;
+            if (option.type === "action") return undefined;
+            if (option.type === "number") {
+                return typeof value === "number" && Number.isFinite(value)
+                    ? Math.min(option.max, Math.max(option.min, Math.round(value)))
+                    : option.default;
+            }
             return typeof value === "string" && option.options.some(o => o.value === value) ? value : option.default;
         },
         set: (_, key: string, value: OptionValue) => {
