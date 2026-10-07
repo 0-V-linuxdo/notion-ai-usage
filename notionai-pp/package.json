@@ -1,0 +1,19 @@
+{
+  "name": "notionai-pp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NotionAI++ — a clean-room userscript for Notion AI: usage meter docked to the AI composer and a Notion-style chat navigator.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "bun run build.ts",
+    "tsc": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run tsc && bun test && bun run build.ts"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "18.0.1",
+    "@types/bun": "1.3.10",
+    "typescript": "5.9.3"
+  }
+}
