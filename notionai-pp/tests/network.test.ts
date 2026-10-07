@@ -19,7 +19,7 @@ describe("network observer", () => {
         const seen: string[] = [];
         const bodies: string[] = [];
         const original = window.fetch;
-        window.fetch = (async () => new Response(JSON.stringify({ ok: 1 }), { status: 200 })) as typeof fetch;
+        window.fetch = (async () => new Response(JSON.stringify({ ok: 1 }), { status: 200 })) as unknown as typeof fetch;
         const { installHooks } = await import("@api/Network");
         installHooks();
         const stop = observeNetwork({
