@@ -36,6 +36,7 @@ section:last-child { border-bottom: 0; }
 .options { margin-top: 10px; display: grid; gap: 8px; padding-left: 2px; }
 .options[data-off] { opacity: .45; pointer-events: none; }
 label.opt { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
+input[type="color"] { width: 44px; height: 24px; padding: 2px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); cursor: pointer; }
 select { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
 .switch { position: relative; width: 32px; height: 18px; flex: 0 0 auto; appearance: none; margin: 0; border-radius: 99px;
   background: rgba(135,131,120,.3); cursor: pointer; transition: background .15s; }
@@ -102,6 +103,13 @@ export function openSettings() {
             label.append(span);
             if (def.type === "boolean") {
                 label.append(switchInput(Boolean(store[key]), def.label, value => setValue(plugin.name, key, value)));
+            } else if (def.type === "color") {
+                const input = document.createElement("input");
+                input.type = "color";
+                input.value = String(store[key]);
+                input.setAttribute("aria-label", def.label);
+                input.addEventListener("input", () => setValue(plugin.name, key, input.value.toLowerCase()));
+                label.append(input);
             } else {
                 const select = document.createElement("select");
                 for (const option of def.options) select.append(new Option(option.label, option.value, false, store[key] === option.value));

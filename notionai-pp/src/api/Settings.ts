@@ -28,7 +28,17 @@ export interface SelectOption {
     options: { value: string; label: string }[];
 }
 
-export type OptionDef = BooleanOption | SelectOption;
+export interface ColorOption {
+    type: "color";
+    label: string;
+    description?: string;
+    /** #rrggbb */
+    default: string;
+}
+
+export type OptionDef = BooleanOption | SelectOption | ColorOption;
+
+export const isHexColor = (value: unknown): value is string => typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value);
 
 export type OptionsDef = Record<string, OptionDef>;
 
@@ -103,6 +113,7 @@ export function definePluginSettings<D extends OptionsDef>(def: D): PluginSettin
             if (!option) return undefined;
             const value = getValue(owner, key);
             if (option.type === "boolean") return typeof value === "boolean" ? value : option.default;
+            if (option.type === "color") return isHexColor(value) ? value.toLowerCase() : option.default;
             return typeof value === "string" && option.options.some(o => o.value === value) ? value : option.default;
         },
         set: (_, key: string, value: OptionValue) => {
